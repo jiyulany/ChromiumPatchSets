@@ -1,0 +1,107 @@
+diff --git a/chrome/browser/r0_license/r0_license_monitor.cc b/chrome/browser/r0_license/r0_license_monitor.cc
+index fa2cf1b..98acc73 100644
+--- a/chrome/browser/r0_license/r0_license_monitor.cc
++++ b/chrome/browser/r0_license/r0_license_monitor.cc
+@@ -38,9 +38,11 @@
+ #include "chrome/browser/r0_license/install_identity.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "net/base/load_flags.h"
++#include "net/base/net_errors.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ #include "services/network/public/cpp/resource_request.h"
+ #include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
+ #include "third_party/boringssl/src/include/openssl/crypto.h"
+ #include "url/gurl.h"
+ 
+@@ -218,9 +220,9 @@ void R0LicenseMonitor::InitOnUiThread() {
+     return;
+   }
+ 
+-  // Secure-clear api_key now that its hash is derived.
+-  OPENSSL_cleanse(const_cast<char*>(api_key_.data()), api_key_.size());
+-  api_key_.clear();
++  // NOTE: api_key_ must stay intact here. StartLease() sends it verbatim in
++  // the start request body and needs it again for network-error retries; it
++  // is securely cleared in OnStartResponse() once the start phase is over.
+ 
+   LOG(INFO) << "[r0_license] starting lease against " << api_base_
+             << " install_id=" << install_id_
+@@ -286,7 +288,9 @@ void R0LicenseMonitor::StartLease() {
+                                                  kLeaseTrafficAnnotation);
+   loader->AttachStringForUpload(body, "application/json");
+   loader->SetTimeoutDuration(kRequestTimeout);
+-  loader->SetAllowHttpErrorResults(false);
++  // Deliver 4xx/5xx bodies too so OnStartResponse can branch on the status
++  // code instead of conflating server rejections with network failures.
++  loader->SetAllowHttpErrorResults(true);
+   loader->DownloadToString(
+       url_loader_factory_.get(),
+       base::BindOnce(&R0LicenseMonitor::OnStartResponse,
+@@ -296,10 +300,35 @@ void R0LicenseMonitor::StartLease() {
+ }
+ 
+ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
++  // Capture transport/server outcome before releasing the loader.
++  int net_error = net::OK;
++  int http_status = 0;
++  if (active_loader_) {
++    net_error = active_loader_->NetError();
++    const network::mojom::URLResponseHead* head =
++        active_loader_->ResponseInfo();
++    if (head && head->headers) {
++      http_status = head->headers->response_code();
++    }
++  }
++
++  // Transient conditions (transport failure / 408 / 429 / 5xx) are retried
++  // with backoff; any other 4xx is a definitive server rejection.
++  const bool retryable = !body || net_error != net::OK || http_status == 408 ||
++                         http_status == 429 || http_status >= 500;
++
++  // Diagnostics: log the full picture on any non-success outcome. On success
++  // the body contains the lease secret, so it is deliberately not logged.
++  if (retryable || http_status >= 400) {
++    LOG(ERROR) << "[r0_license] start diagnostics: net_error=" << net_error
++               << " http_status=" << http_status << " body="
++               << (body ? *body : std::string("<null>"));
++  }
++
+   active_loader_.reset();
+   if (closing_) return;
+ 
+-  if (!body) {
++  if (retryable) {
+     // Retryable: brief backoff and try up to kMaxStartRetries.
+     if (start_retries_ < kMaxStartRetries) {
+       const int delay_ms = 250 << start_retries_;
+@@ -311,13 +340,26 @@ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
+           base::Milliseconds(delay_ms));
+       return;
+     }
+-    HandleFatal(
+-        "the authorization service is temporarily unavailable; the API key "
+-        "was not rejected");
++    HandleFatal(base::StringPrintf(
++        "the authorization service is temporarily unavailable (net_error=%d "
++        "http_status=%d); the API key was not rejected",
++        net_error, http_status));
++    return;
++  }
++  if (http_status >= 400) {
++    HandleFatal(base::StringPrintf(
++        "the authorization service rejected the start request with HTTP %d",
++        http_status));
+     return;
+   }
+   start_retries_ = 0;
+ 
++  // The start phase is definitively over once any response body arrived:
++  // no further start requests will be made (heartbeats use the signed
++  // token), so the raw API key can be securely cleared now.
++  OPENSSL_cleanse(const_cast<char*>(api_key_.data()), api_key_.size());
++  api_key_.clear();
++
+   // Validate Content-Type / size before trusting the body.
+   // SimpleURLLoader does not currently surface Content-Type via the
+   // std::string overload; size cap was enforced by DownloadToString.

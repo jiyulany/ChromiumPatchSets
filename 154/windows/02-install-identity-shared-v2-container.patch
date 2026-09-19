@@ -1,0 +1,122 @@
+diff --git a/chrome/browser/r0_license/install_identity_win.cc b/chrome/browser/r0_license/install_identity_win.cc
+index f773a3a..2d9f300 100644
+--- a/chrome/browser/r0_license/install_identity_win.cc
++++ b/chrome/browser/r0_license/install_identity_win.cc
+@@ -12,6 +12,9 @@
+ #include <windows.h>
+ #include <wincrypt.h>
+ 
++#include <algorithm>
++#include <array>
++
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+ #include "base/logging.h"
+@@ -24,6 +27,13 @@ namespace {
+ constexpr char kIdentityDirectory[] = "R0Browser";
+ constexpr char kIdentityFileBasename[] = "install-id-v2.dat";
+ 
++// Shared v2 container layout, byte-identical to the r0browser-auth-shell
++// reference client, so both tools can read the same identity file:
++//   bytes 0..7   : magic "R0ID" + version 2.0.0 (little endian)
++//   bytes 8..end : DPAPI ciphertext bound to kEntropy
++constexpr std::array<unsigned char, 8> kMagic = {'R', '0', 'I', 'D', 2, 0, 0, 0};
++constexpr wchar_t kEntropy[] = L"r0browser-auth-shell-install-id-v2";
++
+ base::FilePath IdentityFilePath() {
+   base::FilePath local_app_data;
+   if (!base::PathService::Get(base::DIR_LOCAL_APP_DATA, &local_app_data)) {
+@@ -43,28 +53,32 @@ bool EncryptAndWrite(const std::string& plaintext, const base::FilePath& path) {
+   DATA_BLOB input{};
+   input.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plaintext.data()));
+   input.cbData = static_cast<DWORD>(plaintext.size());
++  DATA_BLOB entropy{};
++  entropy.pbData = reinterpret_cast<BYTE*>(const_cast<wchar_t*>(kEntropy));
++  entropy.cbData = sizeof(kEntropy);
+   DATA_BLOB output{};
+-  if (!CryptProtectData(&input, nullptr, nullptr, nullptr, nullptr,
+-                        CRYPTPROTECT_UI_FORBIDDEN, &output)) {
++  if (!CryptProtectData(&input, L"R0 Browser installation identity", &entropy,
++                        nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &output)) {
+     PLOG(ERROR) << "CryptProtectData failed";
+     return false;
+   }
+-  std::string ciphertext(reinterpret_cast<char*>(output.pbData),
+-                        output.cbData);
++  std::string file(reinterpret_cast<const char*>(kMagic.data()), kMagic.size());
++  file.append(reinterpret_cast<char*>(output.pbData), output.cbData);
+   ::LocalFree(output.pbData);
+-  return base::WriteFile(path, ciphertext);
++  return base::WriteFile(path, file);
+ }
+ 
+-bool DecryptFromFile(const base::FilePath& path, std::string* plaintext) {
+-  std::string bytes;
+-  if (!base::ReadFileToString(path, &bytes)) return false;
++bool DpapiDecrypt(const std::string& bytes, bool use_entropy,
++                  std::string* plaintext) {
+   DATA_BLOB input{};
+   input.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(bytes.data()));
+   input.cbData = static_cast<DWORD>(bytes.size());
++  DATA_BLOB entropy{};
++  entropy.pbData = reinterpret_cast<BYTE*>(const_cast<wchar_t*>(kEntropy));
++  entropy.cbData = sizeof(kEntropy);
+   DATA_BLOB output{};
+-  if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, 0,
+-                          &output)) {
+-    PLOG(ERROR) << "CryptUnprotectData failed for existing identity file";
++  if (!CryptUnprotectData(&input, nullptr, use_entropy ? &entropy : nullptr,
++                          nullptr, nullptr, 0, &output)) {
+     return false;
+   }
+   plaintext->assign(reinterpret_cast<char*>(output.pbData), output.cbData);
+@@ -72,6 +86,27 @@ bool DecryptFromFile(const base::FilePath& path, std::string* plaintext) {
+   return true;
+ }
+ 
++// Returns false when the file cannot be decrypted in either format.
++// |legacy_format| is set to true when the file is the old Chromium-only
++// bare-DPAPI container (no magic, no entropy); the caller migrates it.
++bool DecryptFromFile(const base::FilePath& path, std::string* plaintext,
++                     bool* legacy_format) {
++  std::string bytes;
++  if (!base::ReadFileToString(path, &bytes)) return false;
++
++  if (bytes.size() > kMagic.size() &&
++      std::equal(kMagic.begin(), kMagic.end(), bytes.begin())) {
++    // Shared v2 container (auth-shell compatible).
++    *legacy_format = false;
++    return DpapiDecrypt(bytes.substr(kMagic.size()), true, plaintext);
++  }
++
++  // Legacy Chromium-only format: the whole file is a bare DPAPI blob with
++  // no entropy. Kept readable for a smooth one-time migration.
++  *legacy_format = true;
++  return DpapiDecrypt(bytes, false, plaintext);
++}
++
+ // Canonical lowercase UUID: 8-4-4-4-12 hex.
+ bool LooksLikeCanonicalUuid(const std::string& s) {
+   if (s.size() != 36) return false;
+@@ -99,7 +134,8 @@ bool LoadOrCreateInstallId(std::string* install_id, std::string* error) {
+ 
+   if (base::PathExists(path)) {
+     std::string decrypted;
+-    if (!DecryptFromFile(path, &decrypted)) {
++    bool legacy_format = false;
++    if (!DecryptFromFile(path, &decrypted, &legacy_format)) {
+       if (error)
+         *error =
+             "install identity file is corrupted or unreadable; refusing to "
+@@ -110,6 +146,11 @@ bool LoadOrCreateInstallId(std::string* install_id, std::string* error) {
+       if (error) *error = "install identity file has unexpected format";
+       return false;
+     }
++    if (legacy_format) {
++      // Best-effort one-time migration: rewrite the identity in the shared
++      // v2 container so the auth-shell reference client can read it too.
++      EncryptAndWrite(decrypted, path);
++    }
+     *install_id = decrypted;
+     return true;
+   }

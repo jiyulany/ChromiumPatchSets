@@ -1,0 +1,153 @@
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 6bdf26b1a04d3..a4b3ca5afe225 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1444,6 +1449,9 @@ source_set("core") {
+ 
+       # Needed for _variant_t used in browser_dm_token_storage_win.cc
+       "comsuppw.lib",
++
++      # ★ Fingerprint: r0_license 的 install_identity_win.cc 使用 DPAPI。
++      "crypt32.lib",
+     ]
+ 
+     deps += [
+
+diff --git a/chrome/browser/r0_license/install_identity_win.cc b/chrome/browser/r0_license/install_identity_win.cc
+new file mode 100644
+index 0000000000000..f773a3a3647b5
+--- /dev/null
++++ b/chrome/browser/r0_license/install_identity_win.cc
+@@ -0,0 +1,131 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++// TODO(crbug.com/41496758): Convert pointer arithmetic to base::span.
++#pragma allow_unsafe_buffers
++#endif
++
++#include "chrome/browser/r0_license/install_identity.h"
++
++#include <windows.h>
++#include <wincrypt.h>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/logging.h"
++#include "base/path_service.h"
++#include "base/uuid.h"
++
++namespace r0_license {
++namespace {
++
++constexpr char kIdentityDirectory[] = "R0Browser";
++constexpr char kIdentityFileBasename[] = "install-id-v2.dat";
++
++base::FilePath IdentityFilePath() {
++  base::FilePath local_app_data;
++  if (!base::PathService::Get(base::DIR_LOCAL_APP_DATA, &local_app_data)) {
++    return {};
++  }
++  base::FilePath directory = local_app_data.AppendASCII(kIdentityDirectory);
++  return directory.AppendASCII(kIdentityFileBasename);
++}
++
++bool EnsureDirectoryExists(const base::FilePath& path) {
++  if (path.empty()) return false;
++  if (base::DirectoryExists(path)) return true;
++  return base::CreateDirectory(path);
++}
++
++bool EncryptAndWrite(const std::string& plaintext, const base::FilePath& path) {
++  DATA_BLOB input{};
++  input.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plaintext.data()));
++  input.cbData = static_cast<DWORD>(plaintext.size());
++  DATA_BLOB output{};
++  if (!CryptProtectData(&input, nullptr, nullptr, nullptr, nullptr,
++                        CRYPTPROTECT_UI_FORBIDDEN, &output)) {
++    PLOG(ERROR) << "CryptProtectData failed";
++    return false;
++  }
++  std::string ciphertext(reinterpret_cast<char*>(output.pbData),
++                        output.cbData);
++  ::LocalFree(output.pbData);
++  return base::WriteFile(path, ciphertext);
++}
++
++bool DecryptFromFile(const base::FilePath& path, std::string* plaintext) {
++  std::string bytes;
++  if (!base::ReadFileToString(path, &bytes)) return false;
++  DATA_BLOB input{};
++  input.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(bytes.data()));
++  input.cbData = static_cast<DWORD>(bytes.size());
++  DATA_BLOB output{};
++  if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, 0,
++                          &output)) {
++    PLOG(ERROR) << "CryptUnprotectData failed for existing identity file";
++    return false;
++  }
++  plaintext->assign(reinterpret_cast<char*>(output.pbData), output.cbData);
++  ::LocalFree(output.pbData);
++  return true;
++}
++
++// Canonical lowercase UUID: 8-4-4-4-12 hex.
++bool LooksLikeCanonicalUuid(const std::string& s) {
++  if (s.size() != 36) return false;
++  for (std::size_t i = 0; i < 36; ++i) {
++    char c = s[i];
++    if (i == 8 || i == 13 || i == 18 || i == 23) {
++      if (c != '-') return false;
++      continue;
++    }
++    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
++  }
++  return true;
++}
++
++}  // namespace
++
++bool LoadOrCreateInstallId(std::string* install_id, std::string* error) {
++  if (!install_id) return false;
++  install_id->clear();
++  base::FilePath path = IdentityFilePath();
++  if (path.empty()) {
++    if (error) *error = "unable to resolve LocalAppData path";
++    return false;
++  }
++
++  if (base::PathExists(path)) {
++    std::string decrypted;
++    if (!DecryptFromFile(path, &decrypted)) {
++      if (error)
++        *error =
++            "install identity file is corrupted or unreadable; refusing to "
++            "silently generate a new device identity";
++      return false;
++    }
++    if (!LooksLikeCanonicalUuid(decrypted)) {
++      if (error) *error = "install identity file has unexpected format";
++      return false;
++    }
++    *install_id = decrypted;
++    return true;
++  }
++
++  base::Uuid uuid = base::Uuid::GenerateRandomV4();
++  std::string plaintext = uuid.AsLowercaseString();
++  if (!EnsureDirectoryExists(path.DirName())) {
++    if (error) *error = "unable to create identity directory";
++    return false;
++  }
++  if (!EncryptAndWrite(plaintext, path)) {
++    if (error) *error = "unable to persist new install identity";
++    return false;
++  }
++  *install_id = plaintext;
++  return true;
++}
++
++}  // namespace r0_license
+\ No newline at end of file

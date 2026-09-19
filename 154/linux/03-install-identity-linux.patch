@@ -1,0 +1,215 @@
+# patchsets/154/linux/03-install-identity-linux.patch (2026-09-19)
+# Linux 端正式实现（替代已删除的 linux/STUB-install-identity.cc）：
+#   1. chrome/browser/r0_license/install_identity_linux.cc 新增
+#      - 身份文件: ${XDG_DATA_HOME:-$HOME/.local/share}/r0browser/install-id-v2.dat
+#      - base::SetPosixFilePermissions 0600，LooksLikeCanonicalUuid 严格校验（同 Windows 版语义）
+#   2. BUILD.gn: 26.8.3 平台分流——公共 sources 移除 install_identity_win.cc，
+#      is_linux → install_identity_linux.cc，is_win → install_identity_win.cc
+#   3. auth_build_config.h: 26.8.4 R0_AUTH_PLATFORM 改 BUILDFLAG(IS_*) 切换
+#
+# 注意: install_identity_win.cc (cross/01 提供) 在 Linux 树上保留但不参与编译。
+# 理想形态是此处分流逻辑上移到 cross/，但需同步调整 windows/01 的 BUILD.gn
+# hunk 并在 Windows 重验，故暂留 linux/ 层。macOS 落地时再按 26.8.3 补 is_mac。
+#
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index efc43288ac38d..da4553e4d4611 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -855,9 +855,10 @@ source_set("core") {
+     "r0_license/auth_security.h",
+     "r0_license/heartbeat_schedule.h",
+     "r0_license/install_identity.h",
+-    "r0_license/install_identity_win.cc",
+     "r0_license/r0_license_monitor.cc",
+     "r0_license/r0_license_monitor.h",
++    # ★ Fingerprint: r0_license install_identity 平台分流（26.8.3）。
++    # macOS 待实现 install_identity_mac.cc 后加入 is_mac 分支。
+     "chrome_content_browser_client_binder_policies.cc",
+     "chrome_content_browser_client_binder_policies.h",
+     "chrome_content_browser_client_navigation_throttles.cc",
+@@ -885,6 +886,15 @@ source_set("core") {
+     "universal_web_contents_observers.cc",
+   ]
+ 
++  # ★ Fingerprint: r0_license install_identity 平台分流（26.8.3）。
++  # macOS 端待落地 install_identity_mac.cc 后在此追加 is_mac 分支。
++  if (is_linux) {
++    sources += [ "r0_license/install_identity_linux.cc" ]
++  }
++  if (is_win) {
++    sources += [ "r0_license/install_identity_win.cc" ]
++  }
++
+   configs += [
+     "//build/config/compiler:wexit_time_destructors",
+     "//build/config:precompiled_headers",
+diff --git a/chrome/browser/r0_license/auth_build_config.h b/chrome/browser/r0_license/auth_build_config.h
+index 1256fbdab9632..649123cad642c 100644
+--- a/chrome/browser/r0_license/auth_build_config.h
++++ b/chrome/browser/r0_license/auth_build_config.h
+@@ -22,7 +22,25 @@
+   "MCowBQYDK2VwAyEA4ka6yq+7vg5vpEOzhENBUKenSxetb2tC7cFvOF7Btt0="
+ 
+ // Client identity reported to the authorization service.
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_WIN)
+ #define R0_AUTH_PLATFORM "windows-x64"
++#elif BUILDFLAG(IS_MAC)
++#if defined(ARCH_CPU_ARM64)
++#define R0_AUTH_PLATFORM "macos-arm64"
++#else
++#define R0_AUTH_PLATFORM "macos-x64"
++#endif
++#elif BUILDFLAG(IS_LINUX)
++#if defined(ARCH_CPU_ARM64)
++#define R0_AUTH_PLATFORM "linux-arm64"
++#else
++#define R0_AUTH_PLATFORM "linux-x64"
++#endif
++#else
++#define R0_AUTH_PLATFORM "unknown"
++#endif
+ #define R0_AUTH_CLIENT_VERSION "r0-chromium-154-1.0.0"
+ 
+ #endif  // CHROME_BROWSER_R0_LICENSE_AUTH_BUILD_CONFIG_H_
+\ No newline at end of file
+diff --git a/chrome/browser/r0_license/install_identity_linux.cc b/chrome/browser/r0_license/install_identity_linux.cc
+new file mode 100644
+index 0000000000000..4e0adede8bae2
+--- /dev/null
++++ b/chrome/browser/r0_license/install_identity_linux.cc
+@@ -0,0 +1,133 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Linux implementation of the per-installation identity used by the r0 API
++// key lease protocol. The identity is a canonical (lowercase) UUID v4 stored
++// at ${XDG_DATA_HOME:-$HOME/.local/share}/r0browser/install-id-v2.dat with
++// file mode 0600 (owner read/write only).
++//
++// Unlike the Windows implementation (DPAPI) this offers no machine-bound
++// confidentiality: it only protects against other local users reading the
++// file. That is an accepted trade-off; see FRONTEND_INTEGRATION.md 26.8.6.
++
++#include "chrome/browser/r0_license/install_identity.h"
++
++#include <stdlib.h>
++
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/logging.h"
++#include "base/path_service.h"
++#include "base/uuid.h"
++
++namespace r0_license {
++namespace {
++
++constexpr char kIdentityDirectory[] = "r0browser";
++constexpr char kIdentityFileBasename[] = "install-id-v2.dat";
++
++bool LooksLikeCanonicalUuid(const std::string& s) {
++  if (s.size() != 36) {
++    return false;
++  }
++  for (std::size_t i = 0; i < 36; ++i) {
++    char c = s[i];
++    if (i == 8 || i == 13 || i == 18 || i == 23) {
++      if (c != '-') {
++        return false;
++      }
++      continue;
++    }
++    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
++      return false;
++    }
++  }
++  return true;
++}
++
++base::FilePath IdentityFilePath() {
++  // Prefer XDG_DATA_HOME per the XDG base directory spec; fall back to
++  // $HOME/.local/share the same way most desktop Linux software does.
++  const char* xdg_data_home = getenv("XDG_DATA_HOME");
++  if (xdg_data_home && xdg_data_home[0] != '\0') {
++    return base::FilePath(xdg_data_home)
++        .AppendASCII(kIdentityDirectory)
++        .AppendASCII(kIdentityFileBasename);
++  }
++  base::FilePath data_home;
++  if (base::PathService::Get(base::DIR_HOME, &data_home)) {
++    return data_home.Append(".local/share")
++        .AppendASCII(kIdentityDirectory)
++        .AppendASCII(kIdentityFileBasename);
++  }
++  return base::FilePath();
++}
++
++}  // namespace
++
++bool LoadOrCreateInstallId(std::string* install_id, std::string* error) {
++  if (!install_id) {
++    return false;
++  }
++  install_id->clear();
++
++  base::FilePath path = IdentityFilePath();
++  if (path.empty()) {
++    if (error) {
++      *error = "unable to resolve HOME directory";
++    }
++    return false;
++  }
++
++  if (base::PathExists(path)) {
++    std::string contents;
++    if (!base::ReadFileToString(path, &contents)) {
++      if (error) {
++        *error =
++            "install identity file is corrupted or unreadable; refusing to "
++            "silently generate a new device identity";
++      }
++      return false;
++    }
++    if (!LooksLikeCanonicalUuid(contents)) {
++      if (error) {
++        *error = "install identity file has unexpected format";
++      }
++      return false;
++    }
++    *install_id = contents;
++    return true;
++  }
++
++  base::Uuid uuid = base::Uuid::GenerateRandomV4();
++  std::string plaintext = uuid.AsLowercaseString();
++
++  if (!base::CreateDirectory(path.DirName())) {
++    if (error) {
++      *error = "unable to create identity directory";
++    }
++    return false;
++  }
++  if (!base::WriteFile(path, plaintext)) {
++    if (error) {
++      *error = "unable to persist new install identity";
++    }
++    return false;
++  }
++  // 0600: restrict to the owning user. Best effort — failure to tighten
++  // permissions is not fatal (the file only ever contains a random UUID,
++  // not a secret credential).
++  if (!base::SetPosixFilePermissions(
++          path, base::FILE_PERMISSION_READ_BY_USER |
++                   base::FILE_PERMISSION_WRITE_BY_USER)) {
++    LOG(WARNING) << "[r0_license] failed to chmod 0600 on "
++                 << path.value();
++  }
++  *install_id = plaintext;
++  return true;
++}
++
++}  // namespace r0_license

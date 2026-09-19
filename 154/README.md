@@ -4,7 +4,7 @@
 
 - **上游 HEAD**：`325cea974198c8a6ecd931598856c0a63ec8c230`
 - **fingerprint commit**：`<见 commit history>`
-- **当前实测 apply OK**：Windows / macOS / Linux（macOS、Linux 需要 stub 文件）
+- **当前实测 apply OK**：Windows / macOS（需 stub 文件）/ Linux（正式实现）
 
 ## 结构
 
@@ -47,8 +47,18 @@ patchsets/154/
 ├── mac/                                       ★ 只 macOS apply (临时占位)
 │   └── STUB-install-identity.cc               ← macOS stub 实现
 │
-├── linux/                                     ★ 只 Linux apply (临时占位)
-│   └── STUB-install-identity.cc               ← Linux stub 实现
+├── linux/                                     ★ 只 Linux apply (正式实现)
+│   └── 03-install-identity-linux.patch         ← 3 文件 (2026-09-19, 编译通过)
+│           * 新增 install_identity_linux.cc:
+│             身份文件 ${XDG_DATA_HOME:-$HOME/.local/share}/
+│             r0browser/install-id-v2.dat，mode 0600，
+│             LooksLikeCanonicalUuid 严格校验（同 Windows 语义）
+│           * BUILD.gn 26.8.3 平台分流:
+│             is_linux→install_identity_linux.cc,
+│             is_win→install_identity_win.cc（linux 树上保留但不编译）
+│           * auth_build_config.h 26.8.4:
+│             R0_AUTH_PLATFORM 改 BUILDFLAG(IS_*) 切换 (linux-x64 等)
+│           （替代已删除的 linux/STUB-install-identity.cc）
 │
 └── docs/
     ├── PATCH_SYNC_WORKFLOW.md                 ← 后续修改代码如何同步
@@ -79,7 +89,7 @@ apply 脚本会：
 1. 检查 src 工作区干净
 2. 按 `cross/*` → 当前平台分支顺序 apply
 3. 每个 patch 先 `git apply --check` 再 `--apply`，出错就退出
-4. mac / Linux 上还要做：把 `mac/STUB-install-identity.cc` 或 `linux/STUB-install-identity.cc` 复制到 `src/chrome/browser/r0_license/install_identity_win.cc`（因为 BUILD.gn 的 sources 列表里引用了这个文件名）
+4. macOS 端需要手动把 `mac/STUB-install-identity.cc` 复制到 `src/chrome/browser/r0_license/install_identity_win.cc`（BUILD.gn 公共 sources 仍引用该文件名）；Linux 端 `03-install-identity-linux.patch` 已做平台分流，无需 stub
 
 ## 后续修改代码怎么同步
 
@@ -99,11 +109,11 @@ apply 脚本会：
 
 ## 重要约束
 
-⚠️ **cross/01-clearcote-base.patch 当前包含 install_identity_win.cc 的 BUILD.gn 引用**。这意味着 macOS / Linux 端必须提供这个文件名（即使是 stub 实现）才能编译。
+⚠️ **cross/01-clearcote-base.patch 当前包含 install_identity_win.cc 的 BUILD.gn 引用**。这意味着 macOS 端必须提供这个文件名（即使是 stub 实现）才能编译。
 
-长期方案（待做）：按 `FINGERPRINT_MODIFICATION_COMPLETE_GUIDE.md` 26.8.3 把 BUILD.gn 的 sources 列表按 `is_win` / `is_mac` / `is_linux` 分流，配合各端真实的 install_identity_*.cc 实现。
+Linux 端（2026-09-19 起）：`linux/03-install-identity-linux.patch` 已按 `FINGERPRINT_MODIFICATION_COMPLETE_GUIDE.md` 26.8.3 把 sources 分流为 `is_linux` / `is_win` 分支，无需 stub。
 
-短期方案（本 patchset 现状）：用 `mac/STUB-install-identity.cc` / `linux/STUB-install-identity.cc` 替换 install_identity_win.cc 的实际文件内容。
+后续待办：把此分流逻辑上移到 cross/ 层（需同步调整 `windows/01` 的 BUILD.gn hunk 并在 Windows 重验），macOS 落地 `install_identity_mac.cc` 后补 `is_mac` 分支。
 
 ## 三端实测验证结果
 
@@ -111,6 +121,6 @@ apply 脚本会：
 |----|-----------|---------|
 | Windows 325cea9741 | ✓ 通过 | ✓ (待 build 验证) |
 | macOS bbbfd22b | 待测 | 待测 |
-| Linux bbbfd22b | 待测 | 待测 |
+| Linux 16cfddee | ✓ (旧 patch 基线 + cross 01/02 + linux/03) | ✓ `autoninja -C out/Default chrome -j8` 通过 (2026-09-19)；二进制含 `linux-x64` 平台标识，`install_identity_linux.o` 已产出 |
 
 > 注：Windows 端实测是基于原 `000-clearcote-154-all.patch` apply 成功；新 split 后的两份 patch apply 后 src 工作区与原 patch 完全等价（验证已做，见 commit history）。

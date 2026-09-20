@@ -15,7 +15,7 @@ patchsets/154/
 ├── apply.sh                                   ← Linux/macOS 一键 apply
 ├── apply.ps1                                  ← Windows 一键 apply
 ├── 000-clearcote-154-all.patch                ← 完整 snapshot (历史保留，
-│                                              ⚠️ 不含 02-* 增量补丁的内容，
+│                                              ⚠️ 不含 02~05 增量补丁的内容，
 │                                              新端请用 apply.ps1/apply.sh)
 │
 ├── cross/                                     ★ 三端都 apply
@@ -23,15 +23,48 @@ patchsets/154/
 │   │       (chromium 源码 + BUILD.gn + r0_license 6 个跨平台文件 +
 │   │        chrome_browser_main.cc + browser_main_loop.cc,
 │   │        删除 jwt_license/)
-│   └── 02-r0-license-start-hardening.patch    ← 1 文件 (2026-09-19)
-│           r0_license_monitor.cc：
-│           * 修复 api_key_ 在 StartLease() 前被清空的 bug
-│             (服务端 400 被误报为 "temporarily unavailable")
-│           * SetAllowHttpErrorResults(false→true)，4xx/5xx 可拿到 body
-│           * OnStartResponse 按 net_error/http_status 分流：
-│             网络错误/408/429/5xx → 退避重试；其他 4xx → 立即 fatal
-│           * 非成功路径打印 start diagnostics 日志
-│             (成功不打印 body，防 lease secret 泄漏)
+│   ├── 02-r0-license-start-hardening.patch    ← 1 文件 (2026-09-19)
+│   │       r0_license_monitor.cc：
+│   │       * 修复 api_key_ 在 StartLease() 前被清空的 bug
+│   │         (服务端 400 被误报为 "temporarily unavailable")
+│   │       * SetAllowHttpErrorResults(false→true)，4xx/5xx 可拿到 body
+│   │       * OnStartResponse 按 net_error/http_status 分流：
+│   │         网络错误/408/429/5xx → 退避重试；其他 4xx → 立即 fatal
+│   │       * 非成功路径打印 start diagnostics 日志
+│   │         (成功不打印 body，防 lease secret 泄漏)
+│   ├── 03-fingerprint-license-gate.patch      ← 8 文件 (2026-09-20)
+│   │       指纹授权门闩：r0 lease 验签成功前，--fingerprint-config 全部
+│   │       被忽略（hook 退出逻辑只能得到原生指纹的 Chromium，无利用价值）
+│   │       * 新增 content::IsFingerprintAuthorized() 门闩
+│   │         (content/public/browser/fingerprint_authorization.h)
+│   │       * r0_license_monitor.cc：验签成功后 SetFingerprintAuthorized()；
+│   │         kInitStartDelay 3s→100ms、poll 2s→250ms，压缩未授权窗口
+│   │       * 门控 4 处：renderer fingerprint-json 透传、User-Agent、
+│   │         Accept-Language、DNT (RendererPreferences)
+│   │       * 有意不门控（一次性早期消费者，门了会误伤正常用户）：
+│   │         TLS persona (network service 随租约请求一次性启动)、
+│   │         窗口尺寸钳制 (主窗口创建早于验签)
+│   ├── 04-fatal-exit-delay-testing-aid.patch  ← 1 文件 (2026-09-21 重生成)
+│   │       授权失败处理增强 + 测试辅助：
+│   │       * HandleFatal 延迟 10 秒退出（kFatalExitDelay），可用
+│   │         --r0-fatal-exit-delay-ms / R0_FATAL_EXIT_DELAY_MS 覆盖
+│   │         (0..600000)，测试时无需重编译即可拉长观察窗口
+│   │       * 新增 fatal_ 标志 + HasFatalError() 访问器（05 的首窗
+│   │         失败释放依赖它）
+│   │       * 验签成功补日志 "lease established ... gate is OPEN"
+│   │       ⚠️ 发布前把 kFatalExitDelay 改为 0（心跳中途吊销也会多
+│   │       存活这个时长，且此时门闩已开）。注意 05 依赖本补丁的
+│   │       HasFatalError，不要直接删除本补丁。
+│   └── 05-startup-window-license-gate.patch   ← 1 文件 (2026-09-21)
+│           首窗授权挂起（chrome_browser_main.cc）：
+│           * 修复启动竞态：租约异步，首屏 renderer 此前抢在验签前
+│             出生并终身原生指纹（实测 browserscan 首屏改机失效）
+│           * 有 --fingerprint-config 且门闩未开时，挂起
+│             browser_creator_->Start()，主 RunLoop 照常创建，
+│             50ms 轮询直到门闩打开才建首窗 → 所有 renderer 必然
+│             出生在授权后；hook 退出者在挂起期间连窗口都看不到
+│           * HandleFatal（彻底失败）也释放挂起：门闩仍关闭，窗口
+│             显示原生指纹浏览器，便于测试观察失败状态
 │
 ├── windows/                                   ★ 只 Windows apply
 │   ├── 01-clearcote-base.patch                ← 2 文件 / 4935 bytes

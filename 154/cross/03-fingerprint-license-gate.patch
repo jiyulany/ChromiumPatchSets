@@ -1,0 +1,251 @@
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index cdfe827..b251274 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -362,6 +362,7 @@
+ #include "content/public/browser/client_certificate_delegate.h"
+ #include "content/public/browser/digital_identity_provider.h"
+ #include "content/public/browser/file_url_loader.h"
++#include "content/public/browser/fingerprint_authorization.h"
+ #include "content/public/browser/global_routing_id.h"
+ #include "content/public/browser/internal_webui_config.h"
+ #include "content/public/browser/isolated_web_apps_policy.h"
+@@ -1528,6 +1529,12 @@ ChromeContentBrowserClient::ChromeContentBrowserClient() {
+   // user_agent_fp 的 UA 提取 Chrome 主版本号），把 --fingerprint-tls-profile=
+   // chrome-<major> 追加到全局命令行，经 utility_process_host 转发到
+   // network service（net/ssl），使 TLS ClientHello 与 UA 声称的版本一致。
++  //
++  // 授权门闩的有意例外：此处【不】检查 content::IsFingerprintAuthorized()。
++  // network service 随第一个网络请求（通常就是 /start 租约请求）一次性
++  // 启动并终身沿用启动参数，等授权完成再追加会让正常用户的 TLS 指纹永久
++  // 失效。被 hook 的浏览器其余指纹全部缺失，单独的 TLS persona 没有利用
++  // 价值。
+   {
+     std::string config_path =
+         base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+@@ -3352,10 +3359,11 @@ std::string ChromeContentBrowserClient::GetAcceptLangs(
+   // Fingerprint language override for Accept-Language (navigation requests).
+   // Reads the same --fingerprint-config JSON as the renderer process to
+   // ensure consistent Accept-Language header for page navigations.
++  // ★ License gate: ignored until the r0 license lease is verified.
+   std::string config_path =
+       base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+           "fingerprint-config");
+-  if (!config_path.empty()) {
++  if (!config_path.empty() && content::IsFingerprintAuthorized()) {
+     std::string json_str;
+     if (base::ReadFileToString(
+             base::FilePath::FromUTF8Unsafe(config_path), &json_str)) {
+@@ -7738,10 +7746,11 @@ std::string ChromeContentBrowserClient::GetProduct() {
+ 
+ std::string ChromeContentBrowserClient::GetUserAgent() {
+   // Fingerprint override for HTTP User-Agent header
++  // ★ License gate: ignored until the r0 license lease is verified.
+   std::string config_path =
+       base::CommandLine::ForCurrentProcess()
+           ->GetSwitchValueASCII("fingerprint-config");
+-  if (!config_path.empty()) {
++  if (!config_path.empty() && content::IsFingerprintAuthorized()) {
+     std::string json_str;
+     if (base::ReadFileToString(
+             base::FilePath::FromUTF8Unsafe(config_path), &json_str)) {
+diff --git a/chrome/browser/r0_license/r0_license_monitor.cc b/chrome/browser/r0_license/r0_license_monitor.cc
+index 98acc73..2787b24 100644
+--- a/chrome/browser/r0_license/r0_license_monitor.cc
++++ b/chrome/browser/r0_license/r0_license_monitor.cc
+@@ -37,6 +37,7 @@
+ #include "chrome/browser/r0_license/heartbeat_schedule.h"
+ #include "chrome/browser/r0_license/install_identity.h"
+ #include "content/public/browser/browser_thread.h"
++#include "content/public/browser/fingerprint_authorization.h"
+ #include "net/base/load_flags.h"
+ #include "net/base/net_errors.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+@@ -62,9 +63,12 @@ constexpr char kEndPath[] = "/api/v1/client/api-key-leases/end";
+ 
+ // Network and timing.
+ constexpr int kMaxStartRetries = 3;            // start only.
+-constexpr int kMaxInitAttempts = 10;           // ~20 s wait for URL factory.
+-constexpr base::TimeDelta kInitStartDelay = base::Seconds(3);
+-constexpr base::TimeDelta kInitPollInterval = base::Seconds(2);
++constexpr int kMaxInitAttempts = 80;           // ~20 s wait for URL factory.
++// Keep the pre-authorization window small: every renderer spawned before the
++// lease completes runs with stock fingerprints for its whole lifetime, so the
++// first lease attempt should go out as soon as the main loop is up.
++constexpr base::TimeDelta kInitStartDelay = base::Milliseconds(100);
++constexpr base::TimeDelta kInitPollInterval = base::Milliseconds(250);
+ constexpr base::TimeDelta kRequestTimeout = base::Seconds(10);
+ 
+ std::string TrimTrailingSlash(std::string url) {
+@@ -432,6 +436,11 @@ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
+   heartbeat_seconds_ = heartbeat::NormalizeSeconds(
+       *heartbeat_opt, heartbeat::kDefaultHeartbeatSeconds);
+   valid_ = true;
++  // Open the fingerprint gate: only from this point on may any consumer of
++  // --fingerprint-config apply modifications. If the authorization-failure
++  // exit path is ever patched out, the browser keeps running with completely
++  // stock fingerprints.
++  content::SetFingerprintAuthorized();
+ 
+   // Translate the verified wall-clock expiry into a monotonic tick deadline.
+   // Reserve the gap between issued_at and now so a clock skew never inflates
+diff --git a/chrome/browser/renderer_preferences_util.cc b/chrome/browser/renderer_preferences_util.cc
+index c82b4ac..895e74e 100644
+--- a/chrome/browser/renderer_preferences_util.cc
++++ b/chrome/browser/renderer_preferences_util.cc
+@@ -19,6 +19,7 @@
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/net/convert_explicitly_allowed_network_ports_pref.h"
++#include "content/public/browser/fingerprint_authorization.h"
+ #include "content/public/browser/reduce_accept_language_utils.h"
+ #if BUILDFLAG(IS_CHROMEOS)
+ #include "chrome/browser/ash/login/demo_mode/demo_session.h"
+@@ -163,12 +164,13 @@ void UpdateFromSystemSettings(blink::RendererPreferences* prefs,
+   // This single point covers both the JS API (navigator.doNotTrack)
+   // and all HTTP DNT header injection points (navigation + sub-
+   // resources + workers) since they all read from RendererPreferences.
++  // ★ License gate: ignored until the r0 license lease is verified.
+   // ============================================================
+   {
+     std::string config_path =
+         base::CommandLine::ForCurrentProcess()
+             ->GetSwitchValueASCII("fingerprint-config");
+-    if (!config_path.empty()) {
++    if (!config_path.empty() && content::IsFingerprintAuthorized()) {
+       std::string json_str;
+       if (base::ReadFileToString(
+               base::FilePath::FromUTF8Unsafe(config_path), &json_str)) {
+diff --git a/chrome/browser/ui/browser_window_state.cc b/chrome/browser/ui/browser_window_state.cc
+index ae3ae9d..0e6d7ed 100644
+--- a/chrome/browser/ui/browser_window_state.cc
++++ b/chrome/browser/ui/browser_window_state.cc
+@@ -174,6 +174,11 @@ void GetSavedWindowBoundsAndShowState(BrowserWindowInterface* browser,
+   // Limits window size to configured screen.width/height so that
+   // innerWidth/outerWidth naturally match the fake screen size
+   // without needing JS-level clamping.
++  //
++  // 授权门闩的有意例外：此处【不】检查 content::IsFingerprintAuthorized()。
++  // 主窗口创建时机必然早于租约验签完成，加门会让正常用户的 screen_fp
++  // 永久失效；被 hook 的浏览器其余指纹全部缺失，单独的窗口钳制没有利用
++  // 价值（反而因与原生 screen 不一致而更容易被检测）。
+   // ============================================================
+   {
+     std::string config_path =
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index 4e9e524..a6ff4e4 100644
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -1044,6 +1044,8 @@ source_set("browser") {
+     "find_in_page_client.h",
+     "find_request_manager.cc",
+     "find_request_manager.h",
++    "fingerprint_authorization.cc",
++    "../public/browser/fingerprint_authorization.h",
+     "first_party_sets/database/first_party_sets_database.cc",
+     "first_party_sets/database/first_party_sets_database.h",
+     "first_party_sets/first_party_set_parser.cc",
+diff --git a/content/browser/fingerprint_authorization.cc b/content/browser/fingerprint_authorization.cc
+new file mode 100644
+index 0000000..13fda03
+--- /dev/null
++++ b/content/browser/fingerprint_authorization.cc
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/public/browser/fingerprint_authorization.h"
++
++#include <atomic>
++
++namespace content {
++
++namespace {
++
++std::atomic_bool g_fingerprint_authorized{false};
++
++}  // namespace
++
++void SetFingerprintAuthorized() {
++  g_fingerprint_authorized.store(true, std::memory_order_release);
++}
++
++bool IsFingerprintAuthorized() {
++  return g_fingerprint_authorized.load(std::memory_order_acquire);
++}
++
++}  // namespace content
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 4ad15fb..3753c68 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -148,6 +148,7 @@
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/child_process_host.h"
+ #include "content/public/browser/devtools_agent_host.h"
++#include "content/public/browser/fingerprint_authorization.h"
+ #include "content/public/browser/global_routing_id.h"
+ #include "content/public/browser/gpu_client.h"
+ #include "content/public/browser/isolated_context_util.h"
+@@ -3754,8 +3755,15 @@ void RenderProcessHostImpl::AppendRendererCommandLine(
+ 
+   // Pass fingerprint config to Renderer process
+   // Browser reads the file and passes JSON content (Renderer sandbox cannot access files)
++  //
++  // ★ License gate: the config is only honored after the r0 license lease
++  // has been granted and verified (content::SetFingerprintAuthorized). A
++  // renderer launched before authorization keeps stock fingerprints for its
++  // whole lifetime; if the authorization-failure exit path is ever patched
++  // out, no renderer ever receives fingerprint modifications.
+   const base::CommandLine* browser_cmd = base::CommandLine::ForCurrentProcess();
+-  if (browser_cmd->HasSwitch("fingerprint-config")) {
++  if (browser_cmd->HasSwitch("fingerprint-config") &&
++      IsFingerprintAuthorized()) {
+     base::FilePath config_path =
+         browser_cmd->GetSwitchValuePath("fingerprint-config");
+ 
+diff --git a/content/public/browser/fingerprint_authorization.h b/content/public/browser/fingerprint_authorization.h
+new file mode 100644
+index 0000000..7be1a94
+--- /dev/null
++++ b/content/public/browser/fingerprint_authorization.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_PUBLIC_BROWSER_FINGERPRINT_AUTHORIZATION_H_
++#define CONTENT_PUBLIC_BROWSER_FINGERPRINT_AUTHORIZATION_H_
++
++#include "content/common/content_export.h"
++
++namespace content {
++
++// ★ Fingerprint license gate (r0 license lease).
++//
++// Every consumer of --fingerprint-config MUST gate on
++// IsFingerprintAuthorized() and behave as if the switch were absent while it
++// returns false. The flag flips to true exactly once, after the r0 license
++// monitor has obtained a lease and verified the Ed25519 token
++// (R0LicenseMonitor, chrome layer). It deliberately never flips back: any
++// subsequent revocation path terminates the process.
++//
++// Rationale: if the authorization-failure exit path is ever patched out by a
++// reverse engineer, the browser keeps running with completely stock
++// fingerprints, which is worthless for the anti-detection use case.
++//
++// The functions live in the content layer (not chrome/) because
++// RenderProcessHostImpl — the most important consumer — is below the
++// chrome/ layering boundary. Thread-safe; may be called from any thread.
++
++// Marks the fingerprint configuration as authorized. Called by the chrome
++// layer once the license lease has been granted and verified.
++CONTENT_EXPORT void SetFingerprintAuthorized();
++
++// Returns true once SetFingerprintAuthorized() has been called.
++CONTENT_EXPORT bool IsFingerprintAuthorized();
++
++}  // namespace content
++
++#endif  // CONTENT_PUBLIC_BROWSER_FINGERPRINT_AUTHORIZATION_H_

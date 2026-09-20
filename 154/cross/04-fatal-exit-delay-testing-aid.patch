@@ -1,0 +1,78 @@
+diff --git a/chrome/browser/r0_license/r0_license_monitor.cc b/chrome/browser/r0_license/r0_license_monitor.cc
+index 2787b24..57c23e6 100644
+--- a/chrome/browser/r0_license/r0_license_monitor.cc
++++ b/chrome/browser/r0_license/r0_license_monitor.cc
+@@ -26,6 +26,7 @@
+ #include "base/logging.h"
+ #include "base/process/process.h"
+ #include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/cstring_view.h"
+ #include "base/strings/string_util.h"
+@@ -55,6 +56,8 @@ constexpr char kSwitchApiKey[] = "r0-api-key";
+ constexpr char kSwitchApiBase[] = "r0-api-base";
+ constexpr char kEnvApiKey[] = "R0_API_KEY";
+ constexpr char kEnvApiBase[] = "R0_API_BASE";
++constexpr char kSwitchFatalExitDelay[] = "r0-fatal-exit-delay-ms";
++constexpr char kEnvFatalExitDelay[] = "R0_FATAL_EXIT_DELAY_MS";
+ 
+ // Server endpoints.
+ constexpr char kStartPath[] = "/api/v1/client/api-key-leases/start";
+@@ -69,6 +72,13 @@ constexpr int kMaxInitAttempts = 80;           // ~20 s wait for URL factory.
+ // first lease attempt should go out as soon as the main loop is up.
+ constexpr base::TimeDelta kInitStartDelay = base::Milliseconds(100);
+ constexpr base::TimeDelta kInitPollInterval = base::Milliseconds(250);
++// TESTING AID (2026-09-20): delay between a fatal authorization error and
++// process termination, so the running browser can be observed during tests.
++// The fingerprint gate stays closed for the whole window, so a rejected
++// instance never applies --fingerprint-config. NOTE: a mid-session heartbeat
++// revocation also waits this long with an already-open gate — restore to zero
++// for release.
++constexpr base::TimeDelta kFatalExitDelay = base::Seconds(10);
+ constexpr base::TimeDelta kRequestTimeout = base::Seconds(10);
+ 
+ std::string TrimTrailingSlash(std::string url) {
+@@ -441,6 +451,8 @@ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
+   // exit path is ever patched out, the browser keeps running with completely
+   // stock fingerprints.
+   content::SetFingerprintAuthorized();
++  LOG(INFO) << "[r0_license] lease established (heartbeat every "
++            << heartbeat_seconds_ << "s); fingerprint gate is OPEN";
+ 
+   // Translate the verified wall-clock expiry into a monotonic tick deadline.
+   // Reserve the gap between issued_at and now so a clock skew never inflates
+@@ -722,8 +734,31 @@ void R0LicenseMonitor::HandleFatal(const std::string& reason) {
+   LOG(ERROR) << "[r0_license] FATAL: " << reason;
+   closing_ = true;
+   valid_ = false;
++  fatal_ = true;
+   heartbeat_timer_.Stop();
+-  base::Process::TerminateCurrentProcessImmediately(1);
++
++  // Testing aid: keep the process alive briefly so the failure state can be
++  // observed. The startup-window hold (chrome_browser_main.cc) releases on
++  // fatal, so the browser shows up with the fingerprint gate still closed
++  // (completely stock fingerprints) until the process terminates. Delay
++  // defaults to kFatalExitDelay and can be overridden for test sessions via
++  // --r0-fatal-exit-delay-ms or R0_FATAL_EXIT_DELAY_MS (0..600000).
++  base::TimeDelta delay = kFatalExitDelay;
++  if (std::optional<std::string> override =
++          GetSwitchOrEnv(kSwitchFatalExitDelay, kEnvFatalExitDelay)) {
++    int ms = -1;
++    if (base::StringToInt(*override, &ms) && ms >= 0 && ms <= 600000) {
++      delay = base::Milliseconds(ms);
++    }
++  }
++  LOG(ERROR) << "[r0_license] terminating in " << delay.InSeconds()
++             << "s (testing aid); held windows are released with stock "
++                "fingerprints";
++  content::GetUIThreadTaskRunner({})->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(
++          []() { base::Process::TerminateCurrentProcessImmediately(1); }),
++      delay);
+ }
+ 
+ }  // namespace r0_license
+\ No newline at end of file

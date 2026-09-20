@@ -1,0 +1,107 @@
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index 80bddd9..e5af4af 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -127,6 +127,7 @@
+ #include "components/variations/synthetic_trials_active_group_id_provider.h"
+ #include "components/variations/variations_ids_provider.h"
+ #include "content/public/browser/browser_thread.h"
++#include "content/public/browser/fingerprint_authorization.h"
+ #include "content/public/browser/network_service_instance.h"
+ #include "content/public/browser/network_service_util.h"
+ #include "content/public/browser/synthetic_trial_syncer.h"
+@@ -1764,6 +1765,72 @@ void ChromeBrowserMainParts::PostBrowserStart() {
+   AfterStartupTaskUtils::BeginMonitoringStartupCompletion();
+ }
+ 
++#if !BUILDFLAG(IS_ANDROID)
++namespace {
++
++// ★ Fingerprint license gate (r0 license lease).
++//
++// Initial browser window creation is held until the r0 license lease has
++// been granted and verified (content::IsFingerprintAuthorized). A renderer
++// process launched before the gate opens keeps stock fingerprints for its
++// entire lifetime (its command line is fixed at launch), and the lease flow
++// is asynchronous — so without this hold, the first tabs race the lease and
++// would show the real device fingerprint.
++//
++// A definitive failure (R0LicenseMonitor::HandleFatal) also releases the
++// hold: the fingerprint gate stays closed, so the window then shows a
++// completely stock browser — useful for observing the failure state, and
++// still worthless to anyone who patched out the exit path.
++constexpr base::TimeDelta kStartupWindowGatePollInterval =
++    base::Milliseconds(50);
++
++bool ShouldHoldStartupWindowsForLicenseGate() {
++  // Only hold when a fingerprint config was supplied; without one the
++  // fingerprint gate is irrelevant and startup must not wait.
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++             "fingerprint-config") &&
++         !content::IsFingerprintAuthorized();
++}
++
++void StartStartupWindowsWhenAuthorized(
++    std::unique_ptr<StartupBrowserCreator> creator,
++    StartupProfileInfo profile_info,
++    std::vector<Profile*> last_opened_profiles) {
++  // Release on success (fingerprinted renderers) or on definitive failure
++  // (fingerprint gate stays closed → stock renderers; observable failure
++  // state for testing).
++  if (!content::IsFingerprintAuthorized() &&
++      !r0_license::R0LicenseMonitor::GetInstance()->HasFatalError()) {
++    content::GetUIThreadTaskRunner({})->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&StartStartupWindowsWhenAuthorized, std::move(creator),
++                       profile_info, std::move(last_opened_profiles)),
++        kStartupWindowGatePollInterval);
++    return;
++  }
++  const bool gate_open = content::IsFingerprintAuthorized();
++  LOG(INFO) << "[r0_license] creating initial browser windows ("
++            << (gate_open ? "fingerprint gate open"
++                          : "authorization failed; stock fingerprints")
++            << ")";
++  // Mirrors the non-deferred call site below, including its side effects.
++  if (creator->Start(*base::CommandLine::ForCurrentProcess(), base::FilePath(),
++                     profile_info, last_opened_profiles)) {
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_WIN)
++    g_browser_process->StartAutoupdateTimer();
++#endif
++#if BUILDFLAG(IS_LINUX)
++    upgrade_util::SaveLastModifiedTimeOfExe();
++#endif
++    if constexpr (kShouldRecordActiveUse) {
++      GoogleUpdateSettings::SetLastRunTime();
++    }
++  }
++}
++
++}  // namespace
++#endif  // !BUILDFLAG(IS_ANDROID)
++
+ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+   TRACE_EVENT0("startup", "ChromeBrowserMainParts::PreMainMessageLoopRunImpl");
+ 
+@@ -2127,7 +2194,20 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+ #endif
+ 
+   // This step is costly.
+-  if (browser_creator_->Start(*base::CommandLine::ForCurrentProcess(),
++  if (ShouldHoldStartupWindowsForLicenseGate()) {
++    // ★ Fingerprint license gate: hold window creation until the lease is
++    // verified (see ShouldHoldStartupWindowsForLicenseGate). The main run
++    // loop must be created now — it normally happens inside the successful
++    // Start() branch below — so the message loop runs while we wait, and
++    // PostBrowserStart() (which starts the license monitor) still executes.
++    DCHECK(!GetMainRunLoopInstance());
++    GetMainRunLoopInstance() = std::make_unique<base::RunLoop>();
++    browser_process_->SetQuitClosure(
++        GetMainRunLoopInstance()->QuitWhenIdleClosure());
++    StartStartupWindowsWhenAuthorized(std::move(browser_creator_),
++                                      profile_info,
++                                      std::move(last_opened_profiles));
++  } else if (browser_creator_->Start(*base::CommandLine::ForCurrentProcess(),
+                               base::FilePath(), profile_info,
+                               last_opened_profiles)) {
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_WIN)

@@ -15,7 +15,7 @@ patchsets/154/
 ├── apply.sh                                   ← Linux/macOS 一键 apply
 ├── apply.ps1                                  ← Windows 一键 apply
 ├── 000-clearcote-154-all.patch                ← 完整 snapshot (历史保留，
-│                                              ⚠️ 不含 02~05 增量补丁的内容，
+│                                              ⚠️ 不含 02~08 增量补丁的内容，
 │                                              新端请用 apply.ps1/apply.sh)
 │
 ├── cross/                                     ★ 三端都 apply
@@ -55,27 +55,54 @@ patchsets/154/
 │   │       ⚠️ 发布前把 kFatalExitDelay 改为 0（心跳中途吊销也会多
 │   │       存活这个时长，且此时门闩已开）。注意 05 依赖本补丁的
 │   │       HasFatalError，不要直接删除本补丁。
-│   └── 05-startup-window-license-gate.patch   ← 1 文件 (2026-09-21)
-│           首窗授权挂起（chrome_browser_main.cc）：
-│           * 修复启动竞态：租约异步，首屏 renderer 此前抢在验签前
-│             出生并终身原生指纹（实测 browserscan 首屏改机失效）
-│           * 有 --fingerprint-config 且门闩未开时，挂起
-│             browser_creator_->Start()，主 RunLoop 照常创建，
-│             50ms 轮询直到门闩打开才建首窗 → 所有 renderer 必然
-│             出生在授权后；hook 退出者在挂起期间连窗口都看不到
-│           * HandleFatal（彻底失败）也释放挂起：门闩仍关闭，窗口
-│             显示原生指纹浏览器，便于测试观察失败状态
+│   ├── 05-startup-window-license-gate.patch   ← 1 文件 (2026-09-21)
+│   │       首窗授权挂起（chrome_browser_main.cc）：
+│   │       * 修复启动竞态：租约异步，首屏 renderer 此前抢在验签前
+│   │         出生并终身原生指纹（实测 browserscan 首屏改机失效）
+│   │       * 有 --fingerprint-config 且门闩未开时，挂起
+│   │         browser_creator_->Start()，主 RunLoop 照常创建，
+│   │         50ms 轮询直到门闩打开才建首窗 → 所有 renderer 必然
+│   │         出生在授权后；hook 退出者在挂起期间连窗口都看不到
+│   │       * HandleFatal（彻底失败）也释放挂起：门闩仍关闭，窗口
+│   │         显示原生指纹浏览器，便于测试观察失败状态
+│   ├── 06-remove-no-sandbox-banner.patch      ← 1 文件 (2026-09-29)
+│   │       bad_flags_prompt.cc：从 kBadFlags 警告列表移除 kNoSandbox
+│   │       （产品固定带 --no-sandbox 启动，"不受支持的命令行标记"
+│   │       横幅是常驻噪声；其余危险标记警告保留）
+│   ├── 07-remove-google-api-keys-banner.patch ← 1 文件 (2026-09-29)
+│   │       infobar_utils.cc：移除 "缺少 Google API 密钥" infobar
+│   │       触发块（本构建不配置 Google API key，横幅是常驻噪声）
+│   └── 08-silent-logs-and-platform-fp.patch   ← 8 文件 (2026-09-29)
+│           授权日志编译期静默 + navigator.platform 指纹：
+│           * 新增 r0_license/r0_log.h：R0_LOG/R0_PLOG 宏，gn 参数
+│             r0_license_silent_logs=true（生产）时展开为
+│             EAT_STREAM_PARAMETERS，日志字符串编译期从二进制移除，
+│             逆向无法以日志文本定位授权逻辑；默认 false 测试不受影响
+│           * r0_license 模块全部 LOG/PLOG 换成 R0_LOG/R0_PLOG
+│             （monitor.cc 5 处 ERROR + 2 处 INFO，含 startup-hold 在
+│             chrome_browser_main.cc 的 1 处 INFO）
+│           * BUILD.gn：declare_args r0_license_silent_logs +
+│             R0_LICENSE_SILENT define + sources 挂 r0_log.h
+│           * 补收编：r0_license_monitor.h 的 HasFatalError() 声明
+│             （04 重生成时漏收 .h）
+│           * fingerprint_manager.{h,cc}：新增 PlatformConfig 与
+│             platform_fp JSON 解析；navigator_base.cc：platform()
+│             接入覆盖（配置 enabled 且非空时返回自定义值）
 │
 ├── windows/                                   ★ 只 Windows apply
 │   ├── 01-clearcote-base.patch                ← 2 文件 / 4935 bytes
 │   │       (r0_license/install_identity_win.cc +
 │   │        BUILD.gn 加 crypt32.lib)
-│   └── 02-install-identity-shared-v2-container.patch  ← 1 文件 (2026-09-19)
-│           install_identity_win.cc：
-│           * 身份文件改为与 r0browser-auth-shell demo 字节级一致的
-│             v2 容器 (8 字节魔数 R0ID\x02\0\0\0 + entropy DPAPI)
-│           * 兼容读取旧 Chromium 裸 DPAPI 格式并自动迁移重写
-│           * 两工具从此共用 install-id-v2.dat，不再互相报 corrupt
+│   ├── 02-install-identity-shared-v2-container.patch  ← 1 文件 (2026-09-19)
+│   │       install_identity_win.cc：
+│   │       * 身份文件改为与 r0browser-auth-shell demo 字节级一致的
+│   │         v2 容器 (8 字节魔数 R0ID\x02\0\0\0 + entropy DPAPI)
+│   │       * 兼容读取旧 Chromium 裸 DPAPI 格式并自动迁移重写
+│   │       * 两工具从此共用 install-id-v2.dat，不再互相报 corrupt
+│   └── 03-silent-logs-install-identity.patch  ← 1 文件 (2026-09-29)
+│           install_identity_win.cc：include r0_log.h，
+│           PLOG(ERROR) 换成 R0_PLOG(ERROR)，配合 cross/08 的
+│           r0_license_silent_logs 在生产构建中静默
 │
 ├── mac/                                       ★ 只 macOS apply (临时占位)
 │   └── STUB-install-identity.cc               ← macOS stub 实现

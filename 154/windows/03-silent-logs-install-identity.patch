@@ -1,0 +1,21 @@
+diff --git a/chrome/browser/r0_license/install_identity_win.cc b/chrome/browser/r0_license/install_identity_win.cc
+index 2d9f300..2412988 100644
+--- a/chrome/browser/r0_license/install_identity_win.cc
++++ b/chrome/browser/r0_license/install_identity_win.cc
+@@ -8,6 +8,7 @@
+ #endif
+ 
+ #include "chrome/browser/r0_license/install_identity.h"
++#include "chrome/browser/r0_license/r0_log.h"
+ 
+ #include <windows.h>
+ #include <wincrypt.h>
+@@ -59,7 +60,7 @@ bool EncryptAndWrite(const std::string& plaintext, const base::FilePath& path) {
+   DATA_BLOB output{};
+   if (!CryptProtectData(&input, L"R0 Browser installation identity", &entropy,
+                         nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &output)) {
+-    PLOG(ERROR) << "CryptProtectData failed";
++    R0_PLOG(ERROR) << "CryptProtectData failed";
+     return false;
+   }
+   std::string file(reinterpret_cast<const char*>(kMagic.data()), kMagic.size());

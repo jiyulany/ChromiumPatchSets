@@ -1,0 +1,324 @@
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index a4b3ca5..36339df 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -59,6 +59,14 @@ if (is_win) {
+ assert(!is_fuchsia, "Fuchsia shouldn't use anything in //chrome")
+ 
+ declare_args() {
++  # ★ r0_license: strip all authorization-diagnostics logging from the
++  # binary (R0_LOG/R0_PLOG expand to nothing, log strings are removed at
++  # compile time). Keep false for developer/test builds — the logs are the
++  # primary debugging channel for lease failures. Set true only for
++  # production/release builds so the log text cannot be used to locate the
++  # authorization gate in the binary.
++  r0_license_silent_logs = false
++
+   # You can set the variable 'use_official_enterprise_connectors_api_keys' to
+   # true to use the Google-internal file containing official API keys
+   # for enterprise connector partners even in a developer build.  Setting this
+@@ -858,6 +866,7 @@ source_set("core") {
+     "r0_license/install_identity_win.cc",
+     "r0_license/r0_license_monitor.cc",
+     "r0_license/r0_license_monitor.h",
++    "r0_license/r0_log.h",
+     "chrome_content_browser_client_binder_policies.cc",
+     "chrome_content_browser_client_binder_policies.h",
+     "chrome_content_browser_client_navigation_throttles.cc",
+@@ -895,6 +904,11 @@ source_set("core") {
+     defines += [ "USE_OFFICIAL_ENTERPRISE_CONNECTORS_API_KEYS=1" ]
+   }
+ 
++  # ★ r0_license: compile out authorization diagnostics (see r0_log.h).
++  if (r0_license_silent_logs) {
++    defines += [ "R0_LICENSE_SILENT" ]
++  }
++
+   deps = [
+     ":active_use_util",
+     ":after_startup_task_utils",
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index e5af4af..30d8610 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -37,6 +37,7 @@
+ #include "chrome/browser/browser_process_impl.h"
+ #include "chrome/browser/chrome_browser_main_extra_parts.h"
+ #include "chrome/browser/r0_license/r0_license_monitor.h"  // ★ Fingerprint
++#include "chrome/browser/r0_license/r0_log.h"  // ★ Fingerprint: silent logs
+ #include "chrome/browser/component_updater/registration.h"
+ #include "chrome/browser/enterprise/browser_management/management_service_factory.h"
+ #include "chrome/browser/enterprise/chrome_browser_main_extra_parts_enterprise.h"
+@@ -1809,10 +1810,10 @@ void StartStartupWindowsWhenAuthorized(
+     return;
+   }
+   const bool gate_open = content::IsFingerprintAuthorized();
+-  LOG(INFO) << "[r0_license] creating initial browser windows ("
+-            << (gate_open ? "fingerprint gate open"
+-                          : "authorization failed; stock fingerprints")
+-            << ")";
++  R0_LOG(INFO) << "[r0_license] creating initial browser windows ("
++               << (gate_open ? "fingerprint gate open"
++                             : "authorization failed; stock fingerprints")
++               << ")";
+   // Mirrors the non-deferred call site below, including its side effects.
+   if (creator->Start(*base::CommandLine::ForCurrentProcess(), base::FilePath(),
+                      profile_info, last_opened_profiles)) {
+diff --git a/chrome/browser/r0_license/r0_license_monitor.cc b/chrome/browser/r0_license/r0_license_monitor.cc
+index 57c23e6..6494733 100644
+--- a/chrome/browser/r0_license/r0_license_monitor.cc
++++ b/chrome/browser/r0_license/r0_license_monitor.cc
+@@ -37,6 +37,7 @@
+ #include "chrome/browser/r0_license/auth_build_config.h"
+ #include "chrome/browser/r0_license/heartbeat_schedule.h"
+ #include "chrome/browser/r0_license/install_identity.h"
++#include "chrome/browser/r0_license/r0_log.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/fingerprint_authorization.h"
+ #include "net/base/load_flags.h"
+@@ -238,9 +239,9 @@ void R0LicenseMonitor::InitOnUiThread() {
+   // the start request body and needs it again for network-error retries; it
+   // is securely cleared in OnStartResponse() once the start phase is over.
+ 
+-  LOG(INFO) << "[r0_license] starting lease against " << api_base_
+-            << " install_id=" << install_id_
+-            << " instance_id=" << instance_id_;
++  R0_LOG(INFO) << "[r0_license] starting lease against " << api_base_
++               << " install_id=" << install_id_
++               << " instance_id=" << instance_id_;
+ 
+   StartLease();
+ }
+@@ -260,13 +261,13 @@ bool R0LicenseMonitor::ResolveApiBase() {
+   value = TrimTrailingSlash(value);
+   std::string err;
+   if (!ValidateApiBase(value, &err)) {
+-    LOG(ERROR) << "[r0_license] " << err << ": " << value;
++    R0_LOG(ERROR) << "[r0_license] " << err << ": " << value;
+     return false;
+   }
+   api_base_ = value;
+   url_loader_factory_ = g_browser_process->shared_url_loader_factory();
+   if (!url_loader_factory_) {
+-    LOG(ERROR) << "[r0_license] URL loader factory not available";
++    R0_LOG(ERROR) << "[r0_license] URL loader factory not available";
+     return false;
+   }
+   return true;
+@@ -334,7 +335,7 @@ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
+   // Diagnostics: log the full picture on any non-success outcome. On success
+   // the body contains the lease secret, so it is deliberately not logged.
+   if (retryable || http_status >= 400) {
+-    LOG(ERROR) << "[r0_license] start diagnostics: net_error=" << net_error
++    R0_LOG(ERROR) << "[r0_license] start diagnostics: net_error=" << net_error
+                << " http_status=" << http_status << " body="
+                << (body ? *body : std::string("<null>"));
+   }
+@@ -451,8 +452,8 @@ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
+   // exit path is ever patched out, the browser keeps running with completely
+   // stock fingerprints.
+   content::SetFingerprintAuthorized();
+-  LOG(INFO) << "[r0_license] lease established (heartbeat every "
+-            << heartbeat_seconds_ << "s); fingerprint gate is OPEN";
++  R0_LOG(INFO) << "[r0_license] lease established (heartbeat every "
++               << heartbeat_seconds_ << "s); fingerprint gate is OPEN";
+ 
+   // Translate the verified wall-clock expiry into a monotonic tick deadline.
+   // Reserve the gap between issued_at and now so a clock skew never inflates
+@@ -731,7 +732,7 @@ void R0LicenseMonitor::OnEndResponse(std::optional<std::string> body) {
+ }
+ 
+ void R0LicenseMonitor::HandleFatal(const std::string& reason) {
+-  LOG(ERROR) << "[r0_license] FATAL: " << reason;
++  R0_LOG(ERROR) << "[r0_license] FATAL: " << reason;
+   closing_ = true;
+   valid_ = false;
+   fatal_ = true;
+@@ -751,7 +752,7 @@ void R0LicenseMonitor::HandleFatal(const std::string& reason) {
+       delay = base::Milliseconds(ms);
+     }
+   }
+-  LOG(ERROR) << "[r0_license] terminating in " << delay.InSeconds()
++  R0_LOG(ERROR) << "[r0_license] terminating in " << delay.InSeconds()
+              << "s (testing aid); held windows are released with stock "
+                 "fingerprints";
+   content::GetUIThreadTaskRunner({})->PostDelayedTask(
+diff --git a/chrome/browser/r0_license/r0_license_monitor.h b/chrome/browser/r0_license/r0_license_monitor.h
+index 1506a51..65301bd 100644
+--- a/chrome/browser/r0_license/r0_license_monitor.h
++++ b/chrome/browser/r0_license/r0_license_monitor.h
+@@ -54,6 +54,10 @@ class R0LicenseMonitor {
+   // 当前是否已通过 start + token 验签（UI 模块可以用来禁用授权功能）。
+   bool IsAuthorized() const { return valid_; }
+ 
++  // 授权是否已被判定为彻底失败（HandleFatal 已触发）。启动窗口挂起逻辑
++  // 据此在失败时释放窗口，以便观察原生指纹的失败状态。
++  bool HasFatalError() const { return fatal_; }
++
+  private:
+   R0LicenseMonitor();
+   ~R0LicenseMonitor();
+@@ -83,6 +87,7 @@ class R0LicenseMonitor {
+   bool started_ = false;
+   bool closing_ = false;
+   bool valid_ = false;
++  bool fatal_ = false;
+ 
+   // Configuration.
+   std::string api_base_;
+diff --git a/chrome/browser/r0_license/r0_log.h b/chrome/browser/r0_license/r0_log.h
+new file mode 100644
+index 0000000..f7eb420
+--- /dev/null
++++ b/chrome/browser/r0_license/r0_log.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_R0_LICENSE_R0_LOG_H_
++#define CHROME_BROWSER_R0_LICENSE_R0_LOG_H_
++
++#include "base/logging.h"
++
++// Compile-time switch for r0_license diagnostics logging.
++//
++// Default (developer/test builds): R0_LOG is plain LOG(), all authorization
++// diagnostics reach chrome_debug.log / stderr.
++//
++// Production builds (gn arg r0_license_silent_logs = true, which defines
++// R0_LICENSE_SILENT): every R0_LOG stream below expands to
++// EAT_STREAM_PARAMETERS — the same mechanism DLOG uses in release builds.
++// The stream expression becomes compile-time dead code, so the log strings
++// ("[r0_license] FATAL: ...", URL diagnostics, ...) are removed from the
++// binary entirely. Reverse engineers cannot locate the authorization gate
++// by searching for log text, and there is no runtime switch to flip back.
++//
++// Never put security-relevant decisions inside a log stream: in silent
++// builds the stream operands are never evaluated.
++
++#if defined(R0_LICENSE_SILENT)
++
++#define R0_LOG(severity) EAT_STREAM_PARAMETERS
++#define R0_PLOG(severity) EAT_STREAM_PARAMETERS
++
++#else
++
++#define R0_LOG(severity) LOG(severity)
++#define R0_PLOG(severity) PLOG(severity)
++
++#endif  // R0_LICENSE_SILENT
++
++#endif  // CHROME_BROWSER_R0_LICENSE_R0_LOG_H_
+diff --git a/third_party/blink/renderer/core/execution_context/navigator_base.cc b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+index f3f9269..b8ab58d 100644
+--- a/third_party/blink/renderer/core/execution_context/navigator_base.cc
++++ b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+@@ -61,6 +61,13 @@ String NavigatorBase::userAgent() const {
+ }
+ 
+ String NavigatorBase::platform() const {
++  // Fingerprint override for navigator.platform
++  FingerprintManager* fp_mgr = FingerprintManager::GetInstance();
++  PlatformConfig pf_config = fp_mgr->GetPlatformConfig();
++  if (pf_config.enabled && pf_config.is_valid && !pf_config.platform.empty()) {
++    return pf_config.platform;
++  }
++
+ #if BUILDFLAG(IS_ANDROID)
+   // We need to check the ReduceUserAgentMinorVersion feature flag for
+   // Android WebView, which does not currently ship a reduced User-Agent.
+diff --git a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc b/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
+index b78748f..e36ab83 100644
+--- a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
++++ b/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
+@@ -1681,6 +1681,36 @@ bool FingerprintManager::ParseJsonConfig(const std::string& json_content) {
+     hardware_config_.is_valid = false;
+   }
+ 
++  // ============================================================
++  // ★ Parse platform_fp configuration
++  // Overrides navigator.platform (e.g. "Win32", "MacIntel")
++  // ============================================================
++  const base::DictValue* platform_fp_dict =
++      root_dict.FindDict("platform_fp");
++  if (platform_fp_dict) {
++    LOG(INFO) << "[Fingerprint] Parsing 'platform_fp' configuration...";
++
++    absl::optional<bool> pf_enabled =
++        platform_fp_dict->FindBool("enabled");
++    platform_config_.enabled = pf_enabled.value_or(false);
++
++    const std::string* pf_platform =
++        platform_fp_dict->FindString("platform");
++    if (pf_platform && !pf_platform->empty()) {
++      platform_config_.platform = String::FromUtf8(pf_platform->c_str());
++    }
++
++    platform_config_.is_valid = true;
++    LOG(INFO) << "[Fingerprint-DEBUG] Platform config: enabled="
++              << platform_config_.enabled
++              << ", platform=" << platform_config_.platform;
++  } else {
++    LOG(INFO) << "[Fingerprint] No 'platform_fp' config found, "
++                 "navigator.platform override disabled";
++    platform_config_.enabled = false;
++    platform_config_.is_valid = false;
++  }
++
+   // ============================================================
+   // ★ Parse device_memory_fp configuration
+   // Overrides navigator.deviceMemory (RAM size in GB)
+@@ -2107,6 +2137,10 @@ HardwareConfig FingerprintManager::GetHardwareConfig() const {
+   return hardware_config_;
+ }
+ 
++PlatformConfig FingerprintManager::GetPlatformConfig() const {
++  return platform_config_;
++}
++
+ DeviceMemoryConfig FingerprintManager::GetDeviceMemoryConfig() const {
+   return device_memory_config_;
+ }
+diff --git a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.h b/third_party/blink/renderer/core/fingerprint/fingerprint_manager.h
+index a1a1887..d7c8ba7 100644
+--- a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.h
++++ b/third_party/blink/renderer/core/fingerprint/fingerprint_manager.h
+@@ -226,6 +226,19 @@ struct HardwareConfig {
+   bool is_valid = false;
+ };
+ 
++// ============================================================
++// Navigator platform fingerprint configuration (platform_fp in JSON)
++// Overrides navigator.platform (e.g. "Win32", "MacIntel", "Linux x86_64")
++// ============================================================
++struct PlatformConfig {
++  bool enabled = false;
++
++  // Override value for navigator.platform
++  String platform;
++
++  bool is_valid = false;
++};
++
+ // ============================================================
+ // Device memory fingerprint configuration (device_memory_fp in JSON)
+ // Overrides navigator.deviceMemory (RAM size in GB)
+@@ -429,6 +442,9 @@ class FingerprintManager {
+   // Get Hardware (CPU core count) configuration (thread-safe)
+   HardwareConfig GetHardwareConfig() const;
+ 
++  // Get Navigator platform configuration (thread-safe)
++  PlatformConfig GetPlatformConfig() const;
++
+   // Get DeviceMemory configuration (thread-safe)
+   DeviceMemoryConfig GetDeviceMemoryConfig() const;
+ 
+@@ -519,6 +535,7 @@ class FingerprintManager {
+   LanguageConfig language_config_;
+   TimezoneConfig timezone_config_;
+   HardwareConfig hardware_config_;
++  PlatformConfig platform_config_;
+   DeviceMemoryConfig device_memory_config_;
+   UserAgentFpConfig user_agent_fp_config_;
+   ClientRectsConfig client_rects_config_;

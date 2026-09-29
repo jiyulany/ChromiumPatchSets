@@ -1,0 +1,15 @@
+diff --git a/chrome/browser/ui/startup/bad_flags_prompt.cc b/chrome/browser/ui/startup/bad_flags_prompt.cc
+index ec4de18..61c3414 100644
+--- a/chrome/browser/ui/startup/bad_flags_prompt.cc
++++ b/chrome/browser/ui/startup/bad_flags_prompt.cc
+@@ -91,7 +91,9 @@ const char* const kBadFlags[] = {
+     sandbox::policy::switches::kDisableSeccompFilterSandbox,
+     sandbox::policy::switches::kDisableSetuidSandbox,
+     sandbox::policy::switches::kDisableWebNNCompilerSandbox,
+-    sandbox::policy::switches::kNoSandbox,
++    // ★ Fingerprint build: kNoSandbox intentionally removed — the product
++    // always launches with --no-sandbox, so the "unsupported command-line
++    // flag" infobar would be permanent noise.
+ #if BUILDFLAG(IS_WIN)
+     sandbox::policy::switches::kAllowThirdPartyModules,
+ #endif

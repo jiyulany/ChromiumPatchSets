@@ -15,7 +15,7 @@ patchsets/154/
 ├── apply.sh                                   ← Linux/macOS 一键 apply
 ├── apply.ps1                                  ← Windows 一键 apply
 ├── 000-clearcote-154-all.patch                ← 完整 snapshot (历史保留，
-│                                              ⚠️ 不含 02~08 增量补丁的内容，
+│                                              ⚠️ 不含 02~09 增量补丁的内容，
 │                                              新端请用 apply.ps1/apply.sh)
 │
 ├── cross/                                     ★ 三端都 apply
@@ -72,8 +72,8 @@ patchsets/154/
 │   ├── 07-remove-google-api-keys-banner.patch ← 1 文件 (2026-09-29)
 │   │       infobar_utils.cc：移除 "缺少 Google API 密钥" infobar
 │   │       触发块（本构建不配置 Google API key，横幅是常驻噪声）
-│   └── 08-silent-logs-and-platform-fp.patch   ← 8 文件 (2026-09-29)
-│           授权日志编译期静默 + navigator.platform 指纹：
+│   ├── 08-silent-logs-and-platform-fp.patch   ← 8 文件 (2026-09-29)
+│   │       授权日志编译期静默 + navigator.platform 指纹：
 │           * 新增 r0_license/r0_log.h：R0_LOG/R0_PLOG 宏，gn 参数
 │             r0_license_silent_logs=true（生产）时展开为
 │             EAT_STREAM_PARAMETERS，日志字符串编译期从二进制移除，
@@ -88,6 +88,19 @@ patchsets/154/
 │           * fingerprint_manager.{h,cc}：新增 PlatformConfig 与
 │             platform_fp JSON 解析；navigator_base.cc：platform()
 │             接入覆盖（配置 enabled 且非空时返回自定义值）
+│   └── 09-canvas-roundtrip-and-device-memory-ch.patch ← 9 文件 (2026-11-12)
+│           LeakDig Canvas 往返一致性 + Device Memory CH 同源：
+│           * BaseRenderingContext2D 跟踪 image-only 画布：纯 drawImage
+│             画布在 getImageData/toDataURL/convertToBlob 中免噪，
+│             base64 白名单命中 #0、输出 11426B
+│           * 同一画布内容仅加噪写回一次，避免半透明像素重复
+│             premultiply/unpremultiply 产生 ±1 漂移；真实绘制使状态失效，
+│             drawImage 像素遍历差异 0/31200；保护左上角 (0,0) 像素
+│           * HTMLCanvasElement 与 OffscreenCanvas 共用噪声 readback，
+│             保持普通 Canvas 与 OffscreenCanvas 输出一致
+│           * navigator.deviceMemory、browser 导航 Client Hints、renderer
+│             子资源 Client Hints 统一读取 device_memory_fp；旧/新
+│             device-memory 与 sec-ch-device-memory 请求头均为同一值
 │
 ├── windows/                                   ★ 只 Windows apply
 │   ├── 01-clearcote-base.patch                ← 2 文件 / 4935 bytes

@@ -1,0 +1,298 @@
+diff --git a/content/browser/client_hints/client_hints.cc b/content/browser/client_hints/client_hints.cc
+index 8e12b20..7262269 100644
+--- a/content/browser/client_hints/client_hints.cc
++++ b/content/browser/client_hints/client_hints.cc
+@@ -34,6 +34,7 @@
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/client_hints_controller_delegate.h"
+ #include "content/public/browser/content_browser_client.h"
++#include "content/public/browser/fingerprint_authorization.h"
+ #include "content/public/browser/host_zoom_map.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/content_client.h"
+@@ -238,12 +239,46 @@ void RemoveClientHintHeader(WebClientHintsType client_hint_type,
+   headers->RemoveHeader(network::GetClientHintToNameMap().at(client_hint_type));
+ }
+ 
++std::optional<float> GetFingerprintDeviceMemory() {
++  // Browser-side navigation Client Hints must use the same configuration as
++  // navigator.deviceMemory and renderer-generated subresource hints.
++  if (!IsFingerprintAuthorized()) {
++    return std::nullopt;
++  }
++  const std::string config_path =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "fingerprint-config");
++  if (config_path.empty()) {
++    return std::nullopt;
++  }
++  std::string json;
++  if (!base::ReadFileToString(base::FilePath::FromUTF8Unsafe(config_path),
++                              &json)) {
++    return std::nullopt;
++  }
++  auto root = base::JSONReader::ReadDict(
++      json, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++  if (!root) {
++    return std::nullopt;
++  }
++  const base::DictValue* config = root->FindDict("device_memory_fp");
++  if (!config || !config->FindBool("enabled").value_or(false)) {
++    return std::nullopt;
++  }
++  const std::optional<double> value = config->FindDouble("device_memory");
++  if (!value || *value <= 0) {
++    return std::nullopt;
++  }
++  return static_cast<float>(*value);
++}
++
+ void AddDeviceMemoryHeader(net::HttpRequestHeaders* headers,
+                            bool use_deprecated_version = false) {
+   DCHECK(headers);
+   blink::ApproximatedDeviceMemory::Initialize();
+   const float device_memory =
+-      blink::ApproximatedDeviceMemory::GetApproximatedDeviceMemory();
++      GetFingerprintDeviceMemory().value_or(
++          blink::ApproximatedDeviceMemory::GetApproximatedDeviceMemory());
+   DCHECK_LT(0.0, device_memory);
+   SetHeaderToDouble(headers,
+                     use_deprecated_version
+diff --git a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc b/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
+index e36ab83..74e2fb1 100644
+--- a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
++++ b/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
+@@ -2142,6 +2142,10 @@ PlatformConfig FingerprintManager::GetPlatformConfig() const {
+ }
+ 
+ DeviceMemoryConfig FingerprintManager::GetDeviceMemoryConfig() const {
++  base::AutoLock auto_lock(lock_);
++  if (!initialized_) {
++    const_cast<FingerprintManager*>(this)->LazyInitialize();
++  }
+   return device_memory_config_;
+ }
+ 
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index 667b0d3..3c239b6 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -1468,8 +1468,13 @@ String HTMLCanvasElement::ToDataURLInternal(
+ 
+             size_t original_length = data_url.length();
+ 
+-            ImageData* image_data = context_2d->getImageData(
+-                0, 0, canvas_width, canvas_height, exception_state);
++            // A pure image canvas keeps its original snapshot encoding. Only
++            // generated artwork enters the noise/readback path.
++            ImageData* image_data =
++                context_2d->IsImageOnlyCanvas()
++                    ? nullptr
++                    : context_2d->getImageData(0, 0, canvas_width, canvas_height,
++                                               exception_state);
+ 
+             if (image_data && !exception_state.HadException()) {
+               scoped_refptr<StaticBitmapImage> updated_image =
+diff --git a/third_party/blink/renderer/core/loader/frame_fetch_context.cc b/third_party/blink/renderer/core/loader/frame_fetch_context.cc
+index a1942de..230c62b 100644
+--- a/third_party/blink/renderer/core/loader/frame_fetch_context.cc
++++ b/third_party/blink/renderer/core/loader/frame_fetch_context.cc
+@@ -675,22 +675,29 @@ void FrameFetchContext::AddClientHintsIfNecessary(
+ 
+   using network::mojom::blink::WebClientHintsType;
+ 
++  // Keep both Device Memory request headers on the same source as
++  // navigator.deviceMemory instead of exposing the physical machine value.
++  float device_memory = ApproximatedDeviceMemory::GetApproximatedDeviceMemory();
++  const DeviceMemoryConfig device_memory_config =
++      FingerprintManager::GetInstance()->GetDeviceMemoryConfig();
++  if (device_memory_config.enabled && device_memory_config.is_valid &&
++      device_memory_config.device_memory > 0) {
++    device_memory = device_memory_config.device_memory;
++  }
++
+   if (ShouldSendClientHint(*policy, resource_origin,
+                            WebClientHintsType::kDeviceMemory_DEPRECATED,
+                            hints_preferences)) {
+     request.SetHttpHeaderField(
+         http_names::kDeviceMemory_DEPRECATED,
+-        AtomicString(String::Number(
+-            ApproximatedDeviceMemory::GetApproximatedDeviceMemory())));
++        AtomicString(String::Number(device_memory)));
+   }
+ 
+   if (ShouldSendClientHint(*policy, resource_origin,
+                            WebClientHintsType::kDeviceMemory,
+                            hints_preferences)) {
+-    request.SetHttpHeaderField(
+-        http_names::kDeviceMemory,
+-        AtomicString(String::Number(
+-            ApproximatedDeviceMemory::GetApproximatedDeviceMemory())));
++    request.SetHttpHeaderField(http_names::kDeviceMemory,
++                               AtomicString(String::Number(device_memory)));
+   }
+ 
+   if (ShouldSendClientHint(*policy, resource_origin,
+diff --git a/third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc b/third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
+index f81d660..4ca9906 100644
+--- a/third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
++++ b/third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
+@@ -24,6 +24,7 @@
+ #include "third_party/blink/renderer/core/fileapi/blob.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/fingerprint/fingerprint_manager.h"
+ #include "third_party/blink/renderer/core/geometry/dom_matrix.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_context_creation_attributes_core.h"
+@@ -38,6 +39,7 @@
+ #include "third_party/blink/renderer/core/inspector/console_message.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
+ #include "third_party/blink/renderer/core/workers/dedicated_worker_global_scope.h"
++#include "third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_state.h"
+ #include "third_party/blink/renderer/platform/fonts/plain_text_painter.h"
+ #include "third_party/blink/renderer/platform/graphics/canvas_resource.h"
+@@ -552,6 +554,19 @@ ScriptPromise<Blob> OffscreenCanvas::convertToBlob(
+     return EmptyPromise();
+   }
+ 
++  // Keep convertToBlob() on the same canvas-noise readback path as
++  // HTMLCanvasElement.toDataURL(). Pure image canvases are left untouched.
++  if (context_->IsRenderingContext2D() &&
++      FingerprintManager::GetInstance()->IsEnabled()) {
++    auto* context_2d = static_cast<BaseRenderingContext2D*>(context_.Get());
++    if (!context_2d->IsImageOnlyCanvas() && context_2d->Width() > 10 &&
++        context_2d->Height() > 10) {
++      NonThrowableExceptionState readback_exception;
++      context_2d->getImageData(0, 0, context_2d->Width(), context_2d->Height(),
++                               readback_exception);
++    }
++  }
++
+   base::TimeTicks start_time = base::TimeTicks::Now();
+   scoped_refptr<StaticBitmapImage> image_bitmap = context_->GetImage();
+   if (image_bitmap) {
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index 422017d..b928705 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -156,7 +156,9 @@ BaseRenderingContext2D::BaseRenderingContext2D(
+ 
+ void BaseRenderingContext2D::ResetInternal() {
+   Canvas2DRecorderContext::ResetInternal();
+-
++  image_only_canvas_ = true;
++  canvas_noise_applied_ = false;
++  applying_canvas_noise_ = false;
+ }
+ 
+ CanvasRenderingContext2DSettings* BaseRenderingContext2D::getContextAttributes()
+@@ -544,7 +546,10 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+       CanvasConfig config = 
+           FingerprintManager::GetInstance()->GetConfig();
+       
+-      if (config.noise_seed != 0 && sw > 10 && sh > 10) {
++      // Pure drawImage() canvases are an image round-trip, not generated
++      // artwork. Keep their pixels and PNG encoding byte-for-byte intact.
++      if (!image_only_canvas_ && !canvas_noise_applied_ &&
++          config.noise_seed != 0 && sw > 10 && sh > 10) {
+         base::span<uint8_t> pixels = image_data->RawByteSpan();
+         
+         if (!pixels.empty()) {
+@@ -581,6 +586,10 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+           for (size_t i = 0; i < target_mods; ++i) {
+             uint32_t row = xorshift_next(pos_state) % static_cast<uint32_t>(sh);
+             uint32_t col = xorshift_next(pos_state) % static_cast<uint32_t>(sw);
++            // Preserve the top-left pixel used by image-rendering probes.
++            if (row == 0 && col == 0) {
++              continue;
++            }
+             uint32_t rgb_channel = xorshift_next(chn_state) % 3;
+             
+             size_t pixel_idx = (static_cast<size_t>(row) * sw + col) * 4 
+@@ -599,9 +608,14 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+                     << noise_count << " pixels modified (canvas: " << sw << "x" 
+                     << sh << ", seed: " << config.noise_seed << ")";
+           
+-          // Write modified pixels BACK to canvas buffer
++          // Write modified pixels BACK exactly once for this canvas state.
++          // Repeated readback/writeback cycles would introduce premultiplied-
++          // alpha rounding drift and break image redraw consistency.
+           NonThrowableExceptionState put_exception;
++          applying_canvas_noise_ = true;
+           this->putImageData(image_data, sx, sy, put_exception);
++          applying_canvas_noise_ = false;
++          canvas_noise_applied_ = !put_exception.HadException();
+         }
+       }
+     }
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.h b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.h
+index e3a1ba8..530471b 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.h
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.h
+@@ -121,6 +121,10 @@ class MODULES_EXPORT BaseRenderingContext2D : public CanvasRenderingContext,
+                                           ImageDataSettings*,
+                                           ExceptionState&);
+ 
++  // True while the canvas contains only pixels from drawImage(). Such canvases
++  // must round-trip image data and PNG encoding without fingerprint noise.
++  bool IsImageOnlyCanvas() const { return image_only_canvas_; }
++
+   void putImageData(ImageData*, int dx, int dy, ExceptionState&);
+   void putImageData(ImageData*,
+                     int dx,
+@@ -325,6 +329,19 @@ class MODULES_EXPORT BaseRenderingContext2D : public CanvasRenderingContext,
+   bool context_restorable_{true};
+   Canvas2DColorParams color_params_;
+ 
++  // Called by both HTMLCanvasElement and OffscreenCanvas WillDraw overrides.
++  // Image draws preserve the image-only state; every other draw disables it.
++  void TrackCanvasContentForNoise(CanvasPerformanceMonitor::DrawType draw_type) {
++    if (applying_canvas_noise_) {
++      return;
++    }
++    // A real draw invalidates the pixels to which noise was previously applied.
++    canvas_noise_applied_ = false;
++    if (draw_type != CanvasPerformanceMonitor::DrawType::kImage) {
++      image_only_canvas_ = false;
++    }
++  }
++
+  private:
+   virtual bool IsHibernating() const { return false; }
+   virtual void EnableAccelerationIfPossible() {}
+@@ -347,6 +364,9 @@ class MODULES_EXPORT BaseRenderingContext2D : public CanvasRenderingContext,
+ 
+   int num_readbacks_performed_ = 0;
+   unsigned read_count_ = 0;
++  bool image_only_canvas_ = true;
++  bool canvas_noise_applied_ = false;
++  bool applying_canvas_noise_ = false;
+   base::RepeatingClosure on_restore_failed_callback_for_testing_;
+   Vector<scoped_refptr<const cc::AnimatedImageFrameIndexMap>>
+       animated_image_frame_index_maps_;
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
+index 6b61173..1dc469e 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
+@@ -541,6 +541,7 @@ MemoryManagedPaintRecorder* CanvasRenderingContext2D::Recorder() {
+ void CanvasRenderingContext2D::WillDraw(
+     const gfx::Rect& dirty_rect,
+     CanvasPerformanceMonitor::DrawType draw_type) {
++  TrackCanvasContentForNoise(draw_type);
+   CHECK(shared_image_provider_ || bitmap_provider_);
+   if (ShouldAntialias()) {
+     gfx::Rect inflated_dirty_rect = dirty_rect;
+diff --git a/third_party/blink/renderer/modules/canvas/offscreencanvas2d/offscreen_canvas_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/offscreencanvas2d/offscreen_canvas_rendering_context_2d.cc
+index c2d9c03..da1e34c 100644
+--- a/third_party/blink/renderer/modules/canvas/offscreencanvas2d/offscreen_canvas_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/offscreencanvas2d/offscreen_canvas_rendering_context_2d.cc
+@@ -447,6 +447,7 @@ const MemoryManagedPaintRecorder* OffscreenCanvasRenderingContext2D::Recorder()
+ void OffscreenCanvasRenderingContext2D::WillDraw(
+     const gfx::Rect& dirty_rect,
+     CanvasPerformanceMonitor::DrawType draw_type) {
++  TrackCanvasContentForNoise(draw_type);
+   CHECK(shared_image_provider_ || bitmap_provider_);
+   gfx::Rect adjusted_dirty_rect = dirty_rect;
+   if (GetState().ShouldAntialias()) {

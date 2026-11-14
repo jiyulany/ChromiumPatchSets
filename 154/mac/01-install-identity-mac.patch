@@ -1,0 +1,288 @@
+# patchsets/154/mac/01-install-identity-mac.patch (2026-09-29)
+# macOS 端正式实现（替代已删除的 mac/STUB-install-identity.cc）：
+#   1. chrome/browser/r0_license/install_identity_mac.cc 新增
+#      - 语义对齐 install_identity_win.cc：canonical UUID v4 严格校验、
+#        身份不可读时 fail-closed（拒绝静默重建，防服务端实例计数虚增）
+#      - 存储用 Keychain generic-password（service "R0Browser",
+#        account "install-id-v2"），kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+#        防 iCloud Keychain 漫游（= DPAPI 的本机绑定语义）
+#      - 纯 C++ + Keychain C API（FRONTEND_INTEGRATION.md 26.8.5），不用 .mm
+#      - 日志走 R0_LOG，配合 cross/08 的 r0_license_silent_logs 生产静默
+#   2. BUILD.gn: 26.8.3 平台分流——公共 sources 移除 install_identity_win.cc，
+#      is_mac → install_identity_mac.cc，is_win → install_identity_win.cc
+#      （mac 树上保留但不编译）；Security/CoreFoundation framework 追加到
+#      下方 is_mac 块的公共 frameworks 列表（GN 要求 frameworks 而非 libs，
+#      且重复赋值会被公共列表覆盖）
+#   3. auth_build_config.h: 26.8.4 R0_AUTH_PLATFORM 改 BUILDFLAG(IS_*) 切换
+#      （与 linux/03 同一份 hunk；macos-arm64 / macos-x64）
+#
+# 验证: security find-generic-password -s "R0Browser" -a "install-id-v2" -w
+#
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -862,11 +862,12 @@ source_set("core") {
+     "r0_license/auth_security.cc",
+     "r0_license/auth_security.h",
+     "r0_license/heartbeat_schedule.h",
+     "r0_license/install_identity.h",
+-    "r0_license/install_identity_win.cc",
+     "r0_license/r0_license_monitor.cc",
+     "r0_license/r0_license_monitor.h",
+     "r0_license/r0_log.h",
++    # ★ Fingerprint: r0_license install_identity 平台分流（26.8.3）。
++    # 平台实现见下方 is_mac / is_win 分支（Linux 见 linux/03）。
+     "chrome_content_browser_client_binder_policies.cc",
+     "chrome_content_browser_client_binder_policies.h",
+     "chrome_content_browser_client_navigation_throttles.cc",
+@@ -893,7 +894,17 @@ source_set("core") {
+     "unexpire_flags.h",
+     "universal_web_contents_observers.cc",
+   ]
+ 
++  # ★ Fingerprint: r0_license install_identity 平台分流（26.8.3）。
++  # Keychain 依赖的 Security/CoreFoundation framework 追加在下方 is_mac
++  # 块的公共 frameworks 列表中（此处重复赋值会被后者覆盖）。
++  if (is_mac) {
++    sources += [ "r0_license/install_identity_mac.cc" ]
++  }
++  if (is_win) {
++    sources += [ "r0_license/install_identity_win.cc" ]
++  }
++
+   configs += [
+     "//build/config/compiler:wexit_time_destructors",
+     "//build/config:precompiled_headers",
+@@ -1596,5 +1606,6 @@ source_set("core") {
+       "AVFoundation.framework",
+       "AuthenticationServices.framework",
++      "CoreFoundation.framework",  # ★ Fingerprint: r0_license Keychain。
+       "CoreVideo.framework",  # Used for the Thumbnail capturer on macOS.
+       "DiskArbitration.framework",
+       "IOKit.framework",
+@@ -1604,5 +1615,6 @@ source_set("core") {
+       "SafariServices.framework",
+       "ScreenCaptureKit.framework",
++      "Security.framework",  # ★ Fingerprint: r0_license Keychain。
+       "SecurityInterface.framework",
+       "UserNotifications.framework",
+       "UniformTypeIdentifiers.framework",
+diff --git a/chrome/browser/r0_license/auth_build_config.h b/chrome/browser/r0_license/auth_build_config.h
+--- a/chrome/browser/r0_license/auth_build_config.h
++++ b/chrome/browser/r0_license/auth_build_config.h
+@@ -22,7 +22,25 @@
+   "MCowBQYDK2VwAyEA4ka6yq+7vg5vpEOzhENBUKenSxetb2tC7cFvOF7Btt0="
+ 
+ // Client identity reported to the authorization service.
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_WIN)
+ #define R0_AUTH_PLATFORM "windows-x64"
++#elif BUILDFLAG(IS_MAC)
++#if defined(ARCH_CPU_ARM64)
++#define R0_AUTH_PLATFORM "macos-arm64"
++#else
++#define R0_AUTH_PLATFORM "macos-x64"
++#endif
++#elif BUILDFLAG(IS_LINUX)
++#if defined(ARCH_CPU_ARM64)
++#define R0_AUTH_PLATFORM "linux-arm64"
++#else
++#define R0_AUTH_PLATFORM "linux-x64"
++#endif
++#else
++#define R0_AUTH_PLATFORM "unknown"
++#endif
+ #define R0_AUTH_CLIENT_VERSION "r0-chromium-154-1.0.0"
+ 
+ #endif  // CHROME_BROWSER_R0_LICENSE_AUTH_BUILD_CONFIG_H_
+\ No newline at end of file
+diff --git a/chrome/browser/r0_license/install_identity_mac.cc b/chrome/browser/r0_license/install_identity_mac.cc
+new file mode 100644
+index 0000000000000..3a1ab36bf206b
+--- /dev/null
++++ b/chrome/browser/r0_license/install_identity_mac.cc
+@@ -0,0 +1,183 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// macOS implementation of the per-installation identity used by the r0 API
++// key lease protocol. Mirrors install_identity_win.cc semantics: the identity
++// is a canonical (lowercase) UUID v4, generated once and then bound to this
++// machine/user. Where Windows stores a DPAPI-protected v2 container on disk,
++// macOS stores the UUID as a Keychain generic-password item (service
++// "R0Browser", account "install-id-v2"), which provides the equivalent
++// machine/user-bound confidentiality through the login keychain.
++//
++// Pure C++ + Keychain C API on purpose (FRONTEND_INTEGRATION.md 26.8.5):
++// no Objective-C / Cocoa, so this stays a plain .cc file with no objc link
++// dependency.
++//
++// Shell verification:
++//   security find-generic-password -s "R0Browser" -a "install-id-v2" -w
++
++#ifdef UNSAFE_BUFFERS_BUILD
++// TODO(crbug.com/41496758): Convert pointer arithmetic to base::span.
++#pragma allow_unsafe_buffers
++#endif
++
++#include "chrome/browser/r0_license/install_identity.h"
++
++#include <CoreFoundation/CoreFoundation.h>
++#include <Security/Security.h>
++
++#include <string>
++
++#include "base/apple/scoped_cftyperef.h"
++#include "base/uuid.h"
++#include "chrome/browser/r0_license/r0_log.h"
++
++namespace r0_license {
++namespace {
++
++constexpr char kServiceName[] = "R0Browser";
++constexpr char kAccountName[] = "install-id-v2";
++
++// Canonical lowercase UUID: 8-4-4-4-12 hex. Same rule as the Windows and
++// Linux implementations.
++bool LooksLikeCanonicalUuid(const std::string& s) {
++  if (s.size() != 36) {
++    return false;
++  }
++  for (std::size_t i = 0; i < 36; ++i) {
++    char c = s[i];
++    if (i == 8 || i == 13 || i == 18 || i == 23) {
++      if (c != '-') {
++        return false;
++      }
++      continue;
++    }
++    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
++      return false;
++    }
++  }
++  return true;
++}
++
++base::apple::ScopedCFTypeRef<CFStringRef> MakeCFString(const char* s) {
++  return base::apple::ScopedCFTypeRef<CFStringRef>(CFStringCreateWithCString(
++      kCFAllocatorDefault, s, kCFStringEncodingUTF8));
++}
++
++// Fills |plaintext| and returns true when the identity item exists. Returns
++// false when the item is absent (|*status| == errSecItemNotFound) or when the
++// Keychain lookup itself failed (locked keychain, access denied, ...); the
++// caller distinguishes the two cases via |*status|.
++bool LoadFromKeychain(std::string* plaintext, OSStatus* status) {
++  base::apple::ScopedCFTypeRef<CFStringRef> service =
++      MakeCFString(kServiceName);
++  base::apple::ScopedCFTypeRef<CFStringRef> account =
++      MakeCFString(kAccountName);
++  const void* keys[] = {kSecClass, kSecAttrService, kSecAttrAccount,
++                        kSecReturnData, kSecMatchLimit};
++  const void* values[] = {kSecClassGenericPassword, service.get(),
++                          account.get(), kCFBooleanTrue, kSecMatchLimitOne};
++  base::apple::ScopedCFTypeRef<CFDictionaryRef> query(CFDictionaryCreate(
++      kCFAllocatorDefault, keys, values, 5, &kCFTypeDictionaryKeyCallBacks,
++      &kCFTypeDictionaryValueCallBacks));
++
++  CFTypeRef result = nullptr;
++  *status = SecItemCopyMatching(query.get(), &result);
++  if (*status != errSecSuccess) {
++    return false;
++  }
++  base::apple::ScopedCFTypeRef<CFDataRef> data(
++      reinterpret_cast<CFDataRef>(result));
++  plaintext->assign(
++      reinterpret_cast<const char*>(CFDataGetBytePtr(data.get())),
++      static_cast<std::size_t>(CFDataGetLength(data.get())));
++  return true;
++}
++
++bool SaveToKeychain(const std::string& plaintext) {
++  base::apple::ScopedCFTypeRef<CFStringRef> service =
++      MakeCFString(kServiceName);
++  base::apple::ScopedCFTypeRef<CFStringRef> account =
++      MakeCFString(kAccountName);
++
++  // Best-effort delete so a retry never trips over errSecDuplicateItem.
++  const void* delete_keys[] = {kSecClass, kSecAttrService, kSecAttrAccount};
++  const void* delete_values[] = {kSecClassGenericPassword, service.get(),
++                                 account.get()};
++  base::apple::ScopedCFTypeRef<CFDictionaryRef> delete_query(
++      CFDictionaryCreate(kCFAllocatorDefault, delete_keys, delete_values, 3,
++                         &kCFTypeDictionaryKeyCallBacks,
++                         &kCFTypeDictionaryValueCallBacks));
++  SecItemDelete(delete_query.get());
++
++  base::apple::ScopedCFTypeRef<CFDataRef> value(
++      CFDataCreate(kCFAllocatorDefault,
++                   reinterpret_cast<const UInt8*>(plaintext.data()),
++                   static_cast<CFIndex>(plaintext.size())));
++  const void* add_keys[] = {kSecClass, kSecAttrService, kSecAttrAccount,
++                            kSecValueData, kSecAttrAccessible};
++  const void* add_values[] = {
++      kSecClassGenericPassword, service.get(), account.get(), value.get(),
++      // ThisDeviceOnly: the identity must never roam via iCloud Keychain;
++      // it is the server-side machine binding anchor (same role as DPAPI
++      // machine binding on Windows).
++      kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly};
++  base::apple::ScopedCFTypeRef<CFDictionaryRef> add_query(CFDictionaryCreate(
++      kCFAllocatorDefault, add_keys, add_values, 5,
++      &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
++
++  OSStatus status = SecItemAdd(add_query.get(), nullptr);
++  if (status != errSecSuccess) {
++    R0_LOG(ERROR) << "[r0_license] SecItemAdd failed: " << status;
++    return false;
++  }
++  return true;
++}
++
++}  // namespace
++
++bool LoadOrCreateInstallId(std::string* install_id, std::string* error) {
++  if (!install_id) {
++    return false;
++  }
++  install_id->clear();
++
++  std::string existing;
++  OSStatus status = errSecSuccess;
++  if (LoadFromKeychain(&existing, &status)) {
++    if (!LooksLikeCanonicalUuid(existing)) {
++      if (error) {
++        *error = "install identity keychain item has unexpected format";
++      }
++      return false;
++    }
++    *install_id = existing;
++    return true;
++  }
++  if (status != errSecItemNotFound) {
++    // Same fail-closed policy as the Windows implementation: a
++    // present-but-unreadable identity must never be silently replaced with a
++    // fresh one (that would inflate the active instance count server-side).
++    R0_LOG(ERROR) << "[r0_license] SecItemCopyMatching failed: " << status;
++    if (error) {
++      *error =
++          "install identity keychain item is unreadable; refusing to "
++          "silently generate a new device identity";
++    }
++    return false;
++  }
++
++  base::Uuid uuid = base::Uuid::GenerateRandomV4();
++  std::string plaintext = uuid.AsLowercaseString();
++  if (!SaveToKeychain(plaintext)) {
++    if (error) {
++      *error = "unable to persist new install identity to Keychain";
++    }
++    return false;
++  }
++  *install_id = plaintext;
++  return true;
++}
++
++}  // namespace r0_license

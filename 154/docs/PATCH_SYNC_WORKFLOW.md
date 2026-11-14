@@ -145,22 +145,16 @@ git push
 
 每次跨版本升级时，**优先重新生成 cross patch**（影响最大），其次是 `chrome_browser_main.cc` 关联的 patch（hunk context 容易飘）。
 
-## 4. macOS / Linux 端 apply 后的临时限制
+## 4. macOS / Linux 端 install_identity 平台分流（已落地）
 
-⚠️ **当前限制**：cross patch 会在 BUILD.gn 里列出 `install_identity_win.cc`。macOS/Linux 上没有这个文件，编译会失败。
+✅ **2026-09-29 起三端均为正式实现，stub 已全部删除**：
 
-**当前临时方案**：
-- macOS：把 `patchsets/154/mac/STUB-install-identity.cc` 复制到 `src/chrome/browser/r0_license/install_identity_win.cc`
-- Linux：把 `patchsets/154/linux/STUB-install-identity.cc` 复制到 `src/chrome/browser/r0_license/install_identity_win.cc`
+- macOS：`mac/01-install-identity-mac.patch` — `install_identity_mac.cc`（Keychain generic-password，语义对齐 win 版）+ BUILD.gn `is_mac` 分流 + Security/CoreFoundation framework
+- Linux：`linux/03-install-identity-linux.patch` — `install_identity_linux.cc`（`~/.local/share/r0browser/install-id-v2.dat`，mode 0600）+ BUILD.gn `is_linux` 分流
 
-STUB 是"返回 false + error 提示"的占位实现，让 macOS/Linux 端**编译通过**但功能不可用（启动 `--r0-api-key=` 会失败，提示需要平台实现）。
+两者都已按 `FINGERPRINT_MODIFICATION_COMPLETE_GUIDE.md` 26.8.3 把 BUILD.gn 公共 sources 里的 `install_identity_win.cc` 移到平台分支，并各自携带 26.8.4 的 `auth_build_config.h` 平台宏 hunk（内容相同，因平台 patch 互斥 apply，不冲突）。
 
-**长期方案**（推荐尽快做）：
-按 `FINGERPRINT_MODIFICATION_COMPLETE_GUIDE.md` 26.8.3 的模板：
-1. 把 BUILD.gn 的 `r0_license/install_identity_win.cc` 从 sources 列表移到 `if (is_win)` 块
-2. 新增 `r0_license/install_identity_mac.cc` / `_linux.cc` 的 sources 到对应 `is_mac` / `is_linux` 块
-3. 重新生成 cross + windows + mac + linux 四个 patch
-4. 删除 STUB 文件
+**注意**：cross patch 的 BUILD.gn 公共 sources 仍引用 `install_identity_win.cc`，平台 patch 不可跳过。后续如把分流上移到 cross/ 层，需去掉 mac/01 与 linux/03 中重复的 BUILD.gn / auth_build_config.h hunk 并在三端重验。
 
 ## 5. 完整工作流示意
 

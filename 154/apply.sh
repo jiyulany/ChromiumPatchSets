@@ -94,6 +94,25 @@ case "$PLATFORM" in
         ;;
 esac
 
+# 3. 独立品牌资源：图片不进入二进制 patch，由平台脚本生成/安装。
+case "$PLATFORM" in
+    mac)
+        bash "$PATCHSET_DIR/branding/generate_icons_macos.sh" "$CHROMIUM_SRC"
+        ;;
+    linux)
+        bash "$PATCHSET_DIR/branding/generate_icons_linux.sh" "$CHROMIUM_SRC"
+        ;;
+    windows)
+        if command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+            powershell.exe -NoProfile -ExecutionPolicy Bypass \
+                -File "$(cygpath -w "$PATCHSET_DIR/branding/generate_icons.ps1")" \
+                -ChromiumSrc "$(cygpath -w "$CHROMIUM_SRC")"
+        else
+            echo "[apply.sh] Windows 下请使用 apply.ps1 生成品牌图标" >&2
+        fi
+        ;;
+esac
+
 echo "[apply.sh] done."
 echo "[apply.sh] 当前 src 工作区状态:"
 git status --short | sed 's/^/  /'

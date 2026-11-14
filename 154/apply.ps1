@@ -67,6 +67,13 @@ try {
         }
     }
 
+    # 4. 独立品牌资源：图片不作为二进制 patch 内嵌，由脚本生成/安装。
+    $brandingGenerator = Join-Path $PatchsetDir 'branding\generate_icons.ps1'
+    if (Test-Path $brandingGenerator) {
+        Write-Host "[apply.ps1] generating R0 branding icons"
+        & $brandingGenerator -ChromiumSrc $ChromiumSrc
+    }
+
     Write-Host "[apply.ps1] done." -ForegroundColor Green
     Write-Host "[apply.ps1] 当前 src 工作区状态:"
     & git status --short

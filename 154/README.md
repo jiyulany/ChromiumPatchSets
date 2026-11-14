@@ -112,10 +112,18 @@ patchsets/154/
 │   │         v2 容器 (8 字节魔数 R0ID\x02\0\0\0 + entropy DPAPI)
 │   │       * 兼容读取旧 Chromium 裸 DPAPI 格式并自动迁移重写
 │   │       * 两工具从此共用 install-id-v2.dat，不再互相报 corrupt
-│   └── 03-silent-logs-install-identity.patch  ← 1 文件 (2026-09-29)
-│           install_identity_win.cc：include r0_log.h，
-│           PLOG(ERROR) 换成 R0_PLOG(ERROR)，配合 cross/08 的
-│           r0_license_silent_logs 在生产构建中静默
+│   ├── 03-silent-logs-install-identity.patch  ← 1 文件 (2026-09-29)
+│   │       install_identity_win.cc：include r0_log.h，
+│   │       PLOG(ERROR) 换成 R0_PLOG(ERROR)，配合 cross/08 的
+│   │       r0_license_silent_logs 在生产构建中静默
+│   └── 04-r0-branding-worker-icon.patch      ← 2 文件 / 纯文本 (2026-11-14)
+│           R0 Worker 数字角标（图片已移至 branding/ 独立资源）：
+│           * BrowserDesktopWindowTreeHostWin 为每个 Browser 窗口生成
+│             独立 HICON，右上角黑底白字显示 --worker-id=1~999
+│           * 1 位圆形、2~3 位自适应加宽胶囊，三位数保持可读
+│           * 覆盖标题栏、任务栏、Alt-Tab；无参数时保持原行为
+│           * 多 Profile 头像角标保留；Profile 图标版本 10→11 自动重建
+│           * 换图说明见 branding/README.md
 │
 ├── mac/                                       ★ 只 macOS apply (临时占位)
 │   └── STUB-install-identity.cc               ← macOS stub 实现
@@ -132,6 +140,15 @@ patchsets/154/
 │           * auth_build_config.h 26.8.4:
 │             R0_AUTH_PLATFORM 改 BUILDFLAG(IS_*) 切换 (linux-x64 等)
 │           （替代已删除的 linux/STUB-install-identity.cc）
+│
+├── branding/                                  ★ 三端独立品牌资源（非 patch）
+│   ├── app_icon.png                           透明母图，换图只改这里
+│   ├── generate_icons.ps1                     Windows ICO + 透明背景处理
+│   ├── generate_icons_macos.sh                macOS ICNS / Assets.car
+│   ├── generate_icons_linux.sh                Linux PNG / XPM
+│   ├── win/*.ico                              已生成的 Windows 图标资源
+│   └── README.md                              三端换图与依赖说明
+│       （apply.ps1/apply.sh 在文本补丁后自动调用对应脚本）
 │
 └── docs/
     ├── PATCH_SYNC_WORKFLOW.md                 ← 后续修改代码如何同步

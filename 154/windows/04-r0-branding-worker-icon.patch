@@ -1,0 +1,166 @@
+diff --git a/chrome/browser/profiles/profile_shortcut_manager_win.cc b/chrome/browser/profiles/profile_shortcut_manager_win.cc
+index 127f270..d685bc5 100644
+--- a/chrome/browser/profiles/profile_shortcut_manager_win.cc
++++ b/chrome/browser/profiles/profile_shortcut_manager_win.cc
+@@ -78,7 +78,7 @@ const int kMaxProfileShortcutFileNameLength = 64;
+ // Incrementing this number will cause profile icons to be regenerated on
+ // profile startup (it should be incremented whenever the product/avatar icons
+ // change, etc).
+-const int kCurrentProfileIconVersion = 10;
++const int kCurrentProfileIconVersion = 11;
+ 
+ bool disabled_for_unit_tests = false;
+ bool disable_unpinning_for_unit_tests = false;
+diff --git a/chrome/browser/ui/views/frame/browser_desktop_window_tree_host_win.cc b/chrome/browser/ui/views/frame/browser_desktop_window_tree_host_win.cc
+index 49786bd..cdc07a0 100644
+--- a/chrome/browser/ui/views/frame/browser_desktop_window_tree_host_win.cc
++++ b/chrome/browser/ui/views/frame/browser_desktop_window_tree_host_win.cc
+@@ -9,9 +9,11 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/ref_counted_delete_on_sequence.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/process/process_handle.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/task_traits.h"
+@@ -39,6 +41,12 @@
+ #include "components/policy/core/common/policy_pref_names.h"
+ #include "components/prefs/pref_service.h"
+ #include "content/public/browser/browser_thread.h"
++#include "skia/ext/font_utils.h"
++#include "skia/ext/legacy_display_globals.h"
++#include "third_party/skia/include/core/SkCanvas.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "third_party/skia/include/core/SkFont.h"
++#include "third_party/skia/include/core/SkImage.h"
+ #include "ui/base/mojom/window_show_state.mojom.h"
+ #include "ui/base/theme_provider.h"
+ #include "ui/base/win/hwnd_metrics.h"
+@@ -379,6 +387,75 @@ bool BrowserDesktopWindowTreeHostWin::GetDwmFrameInsetsInPixels(
+   return true;
+ }
+ 
++namespace {
++
++constexpr int kWorkerIconSize = 48;
++
++int GetWorkerIconId() {
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (!command_line->HasSwitch("worker-id")) {
++    return 0;
++  }
++  int worker_id = 0;
++  if (!base::StringToInt(command_line->GetSwitchValueASCII("worker-id"),
++                         &worker_id) ||
++      worker_id < 1 || worker_id > 999) {
++    return 0;
++  }
++  return worker_id;
++}
++
++SkBitmap CreateWorkerBadgedIcon(const SkBitmap& base_icon, int worker_id) {
++  SkBitmap icon;
++  icon.allocN32Pixels(kWorkerIconSize, kWorkerIconSize);
++  SkCanvas canvas(icon, skia::LegacyDisplayGlobals::GetSkSurfaceProps());
++  canvas.clear(SK_ColorTRANSPARENT);
++  canvas.drawImageRect(base_icon.asImage(),
++                       SkRect::MakeWH(kWorkerIconSize, kWorkerIconSize),
++                       SkSamplingOptions());
++
++  // One digit uses a circle; wider values use a capsule so three digits do
++  // not have to be shrunk into a small circular badge.
++  const std::string text = base::NumberToString(worker_id);
++  const float badge_width =
++      text.size() == 1 ? 24.0f : (text.size() == 2 ? 29.0f : 34.0f);
++  const SkRect badge_bounds =
++      SkRect::MakeLTRB(47.0f - badge_width, 1.0f, 47.0f, 25.0f);
++  SkPaint paint;
++  paint.setAntiAlias(true);
++  paint.setColor(SK_ColorWHITE);
++  canvas.drawRoundRect(badge_bounds, 12.0f, 12.0f, paint);
++  SkRect inner_bounds = badge_bounds;
++  inner_bounds.inset(1.5f, 1.5f);
++  paint.setColor(SkColorSetRGB(0x26, 0x25, 0x2D));
++  canvas.drawRoundRect(inner_bounds, 10.5f, 10.5f, paint);
++
++  SkFont font = skia::DefaultFont();
++  font.setEmbolden(true);
++  SkRect bounds;
++  int text_size = 20;
++  const float max_text_width = badge_width - 6.0f;
++  do {
++    font.setSize(text_size--);
++    font.measureText(text.c_str(), text.size(), SkTextEncoding::kUTF8,
++                     &bounds);
++  } while (text_size >= 9 &&
++           (bounds.width() > max_text_width || bounds.height() > 18.0f));
++
++  paint.reset();
++  paint.setAntiAlias(true);
++  paint.setColor(SK_ColorWHITE);
++  canvas.drawSimpleText(
++      text.c_str(), text.size(), SkTextEncoding::kUTF8,
++      badge_bounds.centerX() - bounds.width() / 2 - bounds.x(),
++      badge_bounds.centerY() - bounds.height() / 2 - bounds.y(), font,
++      paint);
++  return icon;
++}
++
++}  // namespace
++
+ void BrowserDesktopWindowTreeHostWin::HandleCreate() {
+   if (!browser_view_) {
+     return;
+@@ -391,11 +468,14 @@ void BrowserDesktopWindowTreeHostWin::HandleCreate() {
+ 
+   // Use the profile icon as the browser window icon, if there is more
+   // than one profile. This makes alt-tab preview tabs show the profile-specific
+-  // icon in the multi-profile case.
+-  if (g_browser_process->profile_manager()
++  // icon in the multi-profile case. --worker-id additionally adds its numeric
++  // badge for both single-profile and multi-profile windows.
++  const bool use_profile_icon =
++      g_browser_process->profile_manager()
+           ->GetProfileAttributesStorage()
+-          .GetNumberOfProfiles() > 1) {
+-    SetWindowIcon(/*badged=*/true);
++          .GetNumberOfProfiles() > 1;
++  if (use_profile_icon || GetWorkerIconId() > 0) {
++    SetWindowIcon(use_profile_icon);
+   }
+ }
+ 
+@@ -628,7 +708,27 @@ void BrowserDesktopWindowTreeHostWin::SetWindowIcon(bool badged) {
+   // Hold onto the previous icon so that the currently displayed
+   // icon is valid until replaced with the new icon.
+   base::win::ScopedGDIObject<HICON> previous_icon = std::move(icon_handle_);
+-  if (badged) {
++  const int worker_id = GetWorkerIconId();
++  if (worker_id > 0) {
++    SkBitmap base_icon;
++    if (badged) {
++      CHECK(browser_view_);
++      base_icon =
++          GetBadgedIconBitmapForProfile(browser_view_->browser()->GetProfile());
++    } else {
++      std::unique_ptr<gfx::ImageFamily> family = GetAppIconImageFamily();
++      if (family) {
++        base_icon = family->CreateExact(kWorkerIconSize, kWorkerIconSize)
++                        .AsBitmap();
++      }
++    }
++    if (!base_icon.isNull()) {
++      icon_handle_ = IconUtil::CreateHICONFromSkBitmap(
++          CreateWorkerBadgedIcon(base_icon, worker_id));
++    } else {
++      icon_handle_.reset(GetAppIcon());
++    }
++  } else if (badged) {
+     CHECK(browser_view_);
+     icon_handle_ = IconUtil::CreateHICONFromSkBitmap(
+         GetBadgedIconBitmapForProfile(browser_view_->browser()->GetProfile()));

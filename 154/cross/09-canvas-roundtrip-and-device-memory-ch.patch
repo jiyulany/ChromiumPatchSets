@@ -58,21 +58,6 @@ index 8e12b20..7262269 100644
    DCHECK_LT(0.0, device_memory);
    SetHeaderToDouble(headers,
                      use_deprecated_version
-diff --git a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc b/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
-index e36ab83..74e2fb1 100644
---- a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
-+++ b/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
-@@ -2142,6 +2142,10 @@ PlatformConfig FingerprintManager::GetPlatformConfig() const {
- }
- 
- DeviceMemoryConfig FingerprintManager::GetDeviceMemoryConfig() const {
-+  base::AutoLock auto_lock(lock_);
-+  if (!initialized_) {
-+    const_cast<FingerprintManager*>(this)->LazyInitialize();
-+  }
-   return device_memory_config_;
- }
- 
 diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 index 667b0d3..3c239b6 100644
 --- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
@@ -174,7 +159,7 @@ index f81d660..4ca9906 100644
    scoped_refptr<StaticBitmapImage> image_bitmap = context_->GetImage();
    if (image_bitmap) {
 diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-index 422017d..b928705 100644
+index 422017d..53d839c 100644
 --- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 +++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 @@ -156,7 +156,9 @@ BaseRenderingContext2D::BaseRenderingContext2D(
@@ -188,7 +173,7 @@ index 422017d..b928705 100644
  }
  
  CanvasRenderingContext2DSettings* BaseRenderingContext2D::getContextAttributes()
-@@ -544,7 +546,10 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+@@ -544,10 +546,28 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
        CanvasConfig config = 
            FingerprintManager::GetInstance()->GetConfig();
        
@@ -198,9 +183,29 @@ index 422017d..b928705 100644
 +      if (!image_only_canvas_ && !canvas_noise_applied_ &&
 +          config.noise_seed != 0 && sw > 10 && sh > 10) {
          base::span<uint8_t> pixels = image_data->RawByteSpan();
-         
-         if (!pixels.empty()) {
-@@ -581,6 +586,10 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+-        
+-        if (!pixels.empty()) {
++
++        // Solid-color canvases (e.g. CleanIP's rgb(37,99,235) readback probe)
++        // must read back byte-exact: any deviation on a uniform fill is
++        // trivially detectable as tampering. Skip noise when every pixel
++        // shares one RGBA value; real artwork (gradients, text, arcs) still
++        // gets the deterministic idempotent noise above.
++        const auto is_uniform_color = [](base::span<const uint8_t> px) {
++          for (size_t i = 4; i + 3 < px.size(); i += 4) {
++            if (px[i] != px[0] || px[i + 1] != px[1] ||
++                px[i + 2] != px[2] || px[i + 3] != px[3]) {
++              return false;
++            }
++          }
++          return true;
++        };
++
++        if (!pixels.empty() && !is_uniform_color(pixels)) {
+           // Generate deterministic noise pattern (xorshift PRNG)
+           auto xorshift_next = [](uint32_t& state) -> uint32_t {
+             uint32_t x = state;
+@@ -581,6 +601,10 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
            for (size_t i = 0; i < target_mods; ++i) {
              uint32_t row = xorshift_next(pos_state) % static_cast<uint32_t>(sh);
              uint32_t col = xorshift_next(pos_state) % static_cast<uint32_t>(sw);
@@ -211,7 +216,7 @@ index 422017d..b928705 100644
              uint32_t rgb_channel = xorshift_next(chn_state) % 3;
              
              size_t pixel_idx = (static_cast<size_t>(row) * sw + col) * 4 
-@@ -599,9 +608,14 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+@@ -599,9 +623,14 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
                      << noise_count << " pixels modified (canvas: " << sw << "x" 
                      << sh << ", seed: " << config.noise_seed << ")";
            

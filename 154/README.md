@@ -88,7 +88,27 @@ patchsets/154/
 │           * fingerprint_manager.{h,cc}：新增 PlatformConfig 与
 │             platform_fp JSON 解析；navigator_base.cc：platform()
 │             接入覆盖（配置 enabled 且非空时返回自定义值）
-│   └── 09-canvas-roundtrip-and-device-memory-ch.patch ← 9 文件 (2026-11-12)
+│           * 补收编 (2026-11-19)：start 阶段网络容错——代理/网络瞬断
+│             时 start 可重试错误不再 3 次即退出，改为 60 秒容错窗口
+│             （1s→2s→4s→8s 退避，封顶 10s），窗口内任意一次成功即
+│             继续；整窗口无成功才 HandleFatal。服务端明确拒绝
+│             （其他 4xx、valid=false）不放宽，仍立即退出
+│           * 补收编 (2026-11-19)：r0 租约流量直连——专用 NetworkContext
+│             （无 initial_proxy_config/proxy_config_client，mojom 语义
+│             为永不走代理）+ 专用 URLLoaderFactory 替代系统
+│             shared_url_loader_factory，--proxy-server / 系统代理 /
+│             PAC 均不影响鉴权请求
+│           * 补收编 (2026-11-19)：心跳阶段容错——网络失败/超时/408/429/5xx
+│             连续 10 次才 HandleFatal（退避 1s→2s→4s→8s 封顶 10s，±20%
+│             jitter），任意一次成功即清零；重试可跨越签名租约过期，不再
+│             按 lease_deadline_tick_ 判死。吊销类（valid=false、其他 4xx、
+│             JSON/验签异常）仍立即退出；alive 请求补 SetAllowHttpErrorResults
+│             并读取 http_status 区分吊销与瞬断
+│           * 分层修正 (2026-11-19)：fingerprint_manager.cc 的全部改动
+│             （platform_fp + 原 09 的 GetDeviceMemoryConfig lazy-init）
+│             统一收编在本补丁，08/09 不再共享文件，保证按 01→09
+│             数字顺序 apply 不发生上下文依赖
+│   └── 09-canvas-roundtrip-and-device-memory-ch.patch ← 8 文件 (2026-11-12)
 │           LeakDig Canvas 往返一致性 + Device Memory CH 同源：
 │           * BaseRenderingContext2D 跟踪 image-only 画布：纯 drawImage
 │             画布在 getImageData/toDataURL/convertToBlob 中免噪，
@@ -101,6 +121,11 @@ patchsets/154/
 │           * navigator.deviceMemory、browser 导航 Client Hints、renderer
 │             子资源 Client Hints 统一读取 device_memory_fp；旧/新
 │             device-memory 与 sec-ch-device-memory 请求头均为同一值
+│           * 补收编 (2026-11-19)：纯色画布免噪——getImageDataInternal
+│             读回像素 RGBA 全部一致时跳过噪声注入（CleanIP 纯色
+│             rgb(37,99,235) 探针 tampered=false），非纯色真实绘制的
+│             确定性幂等噪声、稳定 hash、往返一致性均不受影响；
+│             fingerprint_manager.cc 的 device-memory lazy-init 已移至 08
 │
 ├── windows/                                   ★ 只 Windows apply
 │   ├── 01-clearcote-base.patch                ← 2 文件 / 4935 bytes

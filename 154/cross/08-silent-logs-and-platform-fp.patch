@@ -65,18 +65,108 @@ index e5af4af..30d8610 100644
    if (creator->Start(*base::CommandLine::ForCurrentProcess(), base::FilePath(),
                       profile_info, last_opened_profiles)) {
 diff --git a/chrome/browser/r0_license/r0_license_monitor.cc b/chrome/browser/r0_license/r0_license_monitor.cc
-index 57c23e6..6494733 100644
+index 57c23e6..8d4ff77 100644
 --- a/chrome/browser/r0_license/r0_license_monitor.cc
 +++ b/chrome/browser/r0_license/r0_license_monitor.cc
-@@ -37,6 +37,7 @@
+@@ -34,16 +34,21 @@
+ #include "base/uuid.h"
+ #include "base/values.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/net/system_network_context_manager.h"
  #include "chrome/browser/r0_license/auth_build_config.h"
  #include "chrome/browser/r0_license/heartbeat_schedule.h"
  #include "chrome/browser/r0_license/install_identity.h"
 +#include "chrome/browser/r0_license/r0_log.h"
  #include "content/public/browser/browser_thread.h"
  #include "content/public/browser/fingerprint_authorization.h"
++#include "content/public/browser/network_service_instance.h"
  #include "net/base/load_flags.h"
-@@ -238,9 +239,9 @@ void R0LicenseMonitor::InitOnUiThread() {
+ #include "net/base/net_errors.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ #include "services/network/public/cpp/resource_request.h"
+ #include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/cpp/wrapper_shared_url_loader_factory.h"
++#include "services/network/public/mojom/url_loader_factory.mojom.h"
+ #include "services/network/public/mojom/url_response_head.mojom.h"
+ #include "third_party/boringssl/src/include/openssl/crypto.h"
+ #include "url/gurl.h"
+@@ -65,8 +70,22 @@ constexpr char kAlivePath[] = "/api/v1/client/api-key-leases/alive";
+ constexpr char kEndPath[] = "/api/v1/client/api-key-leases/end";
+ 
+ // Network and timing.
+-constexpr int kMaxStartRetries = 3;            // start only.
+ constexpr int kMaxInitAttempts = 80;           // ~20 s wait for URL factory.
++// Start-phase tolerance for transient network/proxy failures (2026-11-19):
++// keep retrying for up to kStartRetryWindow with slowed backoff. A single
++// successful lease start inside the window keeps the browser running, so a
++// briefly unavailable proxy does not terminate the process. Only a full
++// window without one success is fatal. Definitive server rejections (4xx,
++// valid=false) are never tolerated.
++constexpr base::TimeDelta kStartRetryWindow = base::Seconds(60);
++constexpr base::TimeDelta kStartRetryDelayCap = base::Seconds(10);
++// Heartbeat-phase tolerance for transient failures (2026-11-19): network
++// errors, timeouts and 408/429/5xx responses retry with slowed backoff for
++// up to kMaxConsecutiveHeartbeatFailures CONSECUTIVE attempts, even past the
++// signed lease expiry; any single successful renewal resets the counter.
++// Definitive rejections (valid=false, other 4xx, malformed JSON, bad token
++// signature) are never tolerated and still terminate immediately.
++constexpr unsigned int kMaxConsecutiveHeartbeatFailures = 10;
+ // Keep the pre-authorization window small: every renderer spawned before the
+ // lease completes runs with stock fingerprints for its whole lifetime, so the
+ // first lease attempt should go out as soon as the main loop is up.
+@@ -186,7 +205,12 @@ void R0LicenseMonitor::Shutdown() {
+ 
+ void R0LicenseMonitor::TryInit(int attempt) {
+   if (closing_) return;
+-  if (!g_browser_process || !g_browser_process->shared_url_loader_factory()) {
++  const bool deps_ready = g_browser_process &&
++                          g_browser_process->system_network_context_manager();
++  if (deps_ready) {
++    EnsureDirectUrlLoaderFactory();
++  }
++  if (!deps_ready || !url_loader_factory_) {
+     if (attempt < kMaxInitAttempts) {
+       init_retry_timer_.Start(
+           FROM_HERE, kInitPollInterval,
+@@ -200,6 +224,37 @@ void R0LicenseMonitor::TryInit(int attempt) {
+   InitOnUiThread();
+ }
+ 
++void R0LicenseMonitor::EnsureDirectUrlLoaderFactory() {
++  if (url_loader_factory_) return;
++
++  // Dedicated NetworkContext WITHOUT any proxy configuration. Per
++  // network_context.mojom, a context created with neither
++  // |initial_proxy_config| nor |proxy_config_client_request| never uses a
++  // proxy. r0 lease traffic therefore always rides the machine's direct
++  // network, unaffected by --proxy-server, PAC or system proxy settings
++  // applied to the main browser contexts.
++  network::mojom::NetworkContextParamsPtr context_params =
++      g_browser_process->system_network_context_manager()
++          ->CreateDefaultNetworkContextParams();
++  direct_network_context_.reset();
++  content::CreateNetworkContextInNetworkService(
++      direct_network_context_.BindNewPipeAndPassReceiver(),
++      std::move(context_params));
++
++  mojo::PendingRemote<network::mojom::URLLoaderFactory> factory_remote;
++  network::mojom::URLLoaderFactoryParamsPtr factory_params =
++      network::mojom::URLLoaderFactoryParams::New();
++  factory_params->process_id = network::OriginatingProcessId::browser();
++  factory_params->is_trusted = true;
++  direct_network_context_->CreateURLLoaderFactory(
++      factory_remote.InitWithNewPipeAndPassReceiver(),
++      std::move(factory_params));
++
++  url_loader_factory_ = network::SharedURLLoaderFactory::Create(
++      std::make_unique<network::WrapperPendingSharedURLLoaderFactory>(
++          std::move(factory_remote)));
++}
++
+ void R0LicenseMonitor::InitOnUiThread() {
+   if (closing_) return;
+   if (!ResolveApiKey()) {
+@@ -238,9 +293,9 @@ void R0LicenseMonitor::InitOnUiThread() {
    // the start request body and needs it again for network-error retries; it
    // is securely cleared in OnStartResponse() once the start phase is over.
  
@@ -89,7 +179,7 @@ index 57c23e6..6494733 100644
  
    StartLease();
  }
-@@ -260,13 +261,13 @@ bool R0LicenseMonitor::ResolveApiBase() {
+@@ -260,15 +315,10 @@ bool R0LicenseMonitor::ResolveApiBase() {
    value = TrimTrailingSlash(value);
    std::string err;
    if (!ValidateApiBase(value, &err)) {
@@ -98,14 +188,15 @@ index 57c23e6..6494733 100644
      return false;
    }
    api_base_ = value;
-   url_loader_factory_ = g_browser_process->shared_url_loader_factory();
-   if (!url_loader_factory_) {
+-  url_loader_factory_ = g_browser_process->shared_url_loader_factory();
+-  if (!url_loader_factory_) {
 -    LOG(ERROR) << "[r0_license] URL loader factory not available";
-+    R0_LOG(ERROR) << "[r0_license] URL loader factory not available";
-     return false;
-   }
+-    return false;
+-  }
    return true;
-@@ -334,7 +335,7 @@ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
+ }
+ 
+@@ -334,7 +384,7 @@ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
    // Diagnostics: log the full picture on any non-success outcome. On success
    // the body contains the lease secret, so it is deliberately not logged.
    if (retryable || http_status >= 400) {
@@ -114,7 +205,57 @@ index 57c23e6..6494733 100644
                 << " http_status=" << http_status << " body="
                 << (body ? *body : std::string("<null>"));
    }
-@@ -451,8 +452,8 @@ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
+@@ -343,21 +393,34 @@ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
+   if (closing_) return;
+ 
+   if (retryable) {
+-    // Retryable: brief backoff and try up to kMaxStartRetries.
+-    if (start_retries_ < kMaxStartRetries) {
+-      const int delay_ms = 250 << start_retries_;
++    // Tolerate transient network/proxy failures for up to kStartRetryWindow:
++    // any single success inside the window is enough; the window only
++    // expires when every attempt failed. Backoff: 1s→2s→4s→8s, capped at
++    // kStartRetryDelayCap so the polling frequency stays gentle.
++    if (start_deadline_tick_.is_null()) {
++      start_deadline_tick_ = base::TimeTicks::Now() + kStartRetryWindow;
++    }
++    if (base::TimeTicks::Now() < start_deadline_tick_) {
+       ++start_retries_;
++      const std::int64_t backoff_ms = std::min<std::int64_t>(
++          1000 << std::min(start_retries_ - 1, 3u),
++          kStartRetryDelayCap.InMilliseconds());
++      R0_LOG(ERROR) << "[r0_license] start retry #" << start_retries_
++                    << " scheduled in " << backoff_ms
++                    << "ms (net_error=" << net_error
++                    << " http_status=" << http_status << ")";
+       content::GetUIThreadTaskRunner({})->PostDelayedTask(
+           FROM_HERE,
+           base::BindOnce(&R0LicenseMonitor::StartLease,
+                          weak_ptr_factory_.GetWeakPtr()),
+-          base::Milliseconds(delay_ms));
++          base::Milliseconds(backoff_ms));
+       return;
+     }
+     HandleFatal(base::StringPrintf(
+-        "the authorization service is temporarily unavailable (net_error=%d "
+-        "http_status=%d); the API key was not rejected",
+-        net_error, http_status));
++        "the authorization service was unreachable for %d seconds "
++        "(net_error=%d http_status=%d); the API key was not rejected",
++        static_cast<int>(kStartRetryWindow.InSeconds()), net_error,
++        http_status));
+     return;
+   }
+   if (http_status >= 400) {
+@@ -367,6 +430,7 @@ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
+     return;
+   }
+   start_retries_ = 0;
++  start_deadline_tick_ = base::TimeTicks();
+ 
+   // The start phase is definitively over once any response body arrived:
+   // no further start requests will be made (heartbeats use the signed
+@@ -451,8 +515,8 @@ void R0LicenseMonitor::OnStartResponse(std::optional<std::string> body) {
    // exit path is ever patched out, the browser keeps running with completely
    // stock fingerprints.
    content::SetFingerprintAuthorized();
@@ -125,7 +266,123 @@ index 57c23e6..6494733 100644
  
    // Translate the verified wall-clock expiry into a monotonic tick deadline.
    // Reserve the gap between issued_at and now so a clock skew never inflates
-@@ -731,7 +732,7 @@ void R0LicenseMonitor::OnEndResponse(std::optional<std::string> body) {
+@@ -492,17 +556,12 @@ bool R0LicenseMonitor::ScheduleRegularHeartbeat() {
+ 
+ void R0LicenseMonitor::HeartbeatTick() {
+   if (closing_ || !valid_) return;
+-  const base::TimeDelta remaining = lease_deadline_tick_ - base::TimeTicks::Now();
+-  if (remaining.is_negative() || remaining.is_zero()) {
+-    HandleFatal("the signed license lease expired before the next heartbeat");
+-    return;
+-  }
++  // Expiry no longer kills the process by itself: transient network failures
++  // may keep retrying past the signed lease expiry until the consecutive
++  // failure cap is reached (ScheduleHeartbeatRetry enforces it).
+   if (!BeginHeartbeat()) {
+     ++consecutive_heartbeat_failures_;
+-    if (!ScheduleHeartbeatRetry()) {
+-      HandleFatal(
+-          "the heartbeat could not be started before signed expiry");
+-    }
++    ScheduleHeartbeatRetry();
+   }
+ }
+ 
+@@ -542,6 +601,9 @@ bool R0LicenseMonitor::BeginHeartbeat() {
+                                                  kLeaseTrafficAnnotation);
+   loader->AttachStringForUpload(pending_alive_body_, "application/json");
+   loader->SetTimeoutDuration(kRequestTimeout);
++  // Deliver 4xx/5xx bodies too, so a definitive revocation (non-retryable
++  // 4xx) is distinguished from transient network failures below.
++  loader->SetAllowHttpErrorResults(true);
+   loader->DownloadToString(
+       url_loader_factory_.get(),
+       base::BindOnce(&R0LicenseMonitor::OnHeartbeatResponse,
+@@ -553,17 +615,43 @@ bool R0LicenseMonitor::BeginHeartbeat() {
+ 
+ void R0LicenseMonitor::OnHeartbeatResponse(
+     std::optional<std::string> body) {
++  // Capture transport/server outcome before releasing the loader (mirrors
++  // OnStartResponse so revocations are not conflated with network failures).
++  int net_error = net::OK;
++  int http_status = 0;
++  if (active_loader_) {
++    net_error = active_loader_->NetError();
++    const network::mojom::URLResponseHead* head =
++        active_loader_->ResponseInfo();
++    if (head && head->headers) {
++      http_status = head->headers->response_code();
++    }
++  }
+   active_loader_.reset();
+   if (closing_) return;
+ 
+-  if (!body) {
+-    // Network error or timeout: keep pending_alive_body so the next retry
+-    // re-sends the exact same JSON (protocol §8 idempotency).
++  const bool retryable = !body || net_error != net::OK || http_status == 408 ||
++                         http_status == 429 || http_status >= 500;
++  if (retryable) {
++    // Transient network/timeout/5xx: keep pending_alive_body so the next
++    // retry re-sends the exact same JSON (protocol §8 idempotency), and
++    // tolerate up to kMaxConsecutiveHeartbeatFailures consecutive failures.
+     ++consecutive_heartbeat_failures_;
+-    if (!ScheduleHeartbeatRetry()) {
+-      HandleFatal(
+-          "the heartbeat could not be renewed before signed expiry");
+-    }
++    R0_LOG(ERROR) << "[r0_license] heartbeat failure #"
++                  << consecutive_heartbeat_failures_ << "/"
++                  << kMaxConsecutiveHeartbeatFailures
++                  << " (net_error=" << net_error
++                  << " http_status=" << http_status << ")";
++    ScheduleHeartbeatRetry();
++    return;
++  }
++  if (http_status >= 400) {
++    OPENSSL_cleanse(const_cast<char*>(pending_alive_body_.data()),
++                    pending_alive_body_.size());
++    pending_alive_body_.clear();
++    HandleFatal(base::StringPrintf(
++        "the authorization service rejected the lease renewal with HTTP %d",
++        http_status));
+     return;
+   }
+ 
+@@ -663,15 +751,24 @@ void R0LicenseMonitor::OnHeartbeatResponse(
+ 
+ bool R0LicenseMonitor::ScheduleHeartbeatRetry() {
+   if (!valid_) return false;
+-  const base::TimeDelta remaining = lease_deadline_tick_ - base::TimeTicks::Now();
+-  const std::uint64_t remaining_ms =
+-      remaining.is_negative() ? 0ULL : static_cast<std::uint64_t>(remaining.InMilliseconds());
+-  const auto plan = heartbeat::RetryDelayForRemainingMs(
+-      consecutive_heartbeat_failures_, heartbeat_seconds_, remaining_ms,
+-      RandomJitterPermille(heartbeat::kRetryJitterPermille));
+-  if (!plan.should_retry) return false;
++  if (consecutive_heartbeat_failures_ >= kMaxConsecutiveHeartbeatFailures) {
++    HandleFatal(base::StringPrintf(
++        "the heartbeat failed %u consecutive times (network/timeout/5xx); "
++        "renewal was not rejected by the server",
++        consecutive_heartbeat_failures_));
++    return false;
++  }
++  // Slowed exponential backoff (1s→2s→4s→8s, capped at 10s) with ±20%
++  // jitter. Retries intentionally continue past the signed lease expiry;
++  // only the consecutive failure cap or a definitive rejection terminates.
++  const unsigned int shift =
++      std::min(consecutive_heartbeat_failures_ - 1, 3u);
++  const std::int64_t backoff_ms = heartbeat::ApplyJitter(
++      std::min<std::uint64_t>(1000ULL << shift, 10000ULL),
++      RandomJitterPermille(heartbeat::kRetryJitterPermille),
++      heartbeat::kRetryJitterPermille);
+   heartbeat_timer_.Start(
+-      FROM_HERE, base::Milliseconds(plan.delay_ms),
++      FROM_HERE, base::Milliseconds(backoff_ms),
+       base::BindRepeating(&R0LicenseMonitor::HeartbeatTick,
+                           weak_ptr_factory_.GetWeakPtr()));
+   return true;
+@@ -731,7 +828,7 @@ void R0LicenseMonitor::OnEndResponse(std::optional<std::string> body) {
  }
  
  void R0LicenseMonitor::HandleFatal(const std::string& reason) {
@@ -134,7 +391,7 @@ index 57c23e6..6494733 100644
    closing_ = true;
    valid_ = false;
    fatal_ = true;
-@@ -751,7 +752,7 @@ void R0LicenseMonitor::HandleFatal(const std::string& reason) {
+@@ -751,7 +848,7 @@ void R0LicenseMonitor::HandleFatal(const std::string& reason) {
        delay = base::Milliseconds(ms);
      }
    }
@@ -144,10 +401,30 @@ index 57c23e6..6494733 100644
                  "fingerprints";
    content::GetUIThreadTaskRunner({})->PostDelayedTask(
 diff --git a/chrome/browser/r0_license/r0_license_monitor.h b/chrome/browser/r0_license/r0_license_monitor.h
-index 1506a51..65301bd 100644
+index 1506a51..534fdb0 100644
 --- a/chrome/browser/r0_license/r0_license_monitor.h
 +++ b/chrome/browser/r0_license/r0_license_monitor.h
-@@ -54,6 +54,10 @@ class R0LicenseMonitor {
+@@ -29,7 +29,9 @@
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "chrome/browser/r0_license/auth_security.h"
++#include "mojo/public/cpp/bindings/remote.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/mojom/network_context.mojom.h"
+ 
+ namespace network {
+ class SimpleURLLoader;
+@@ -48,12 +50,20 @@ class R0LicenseMonitor {
+   // 内部延迟到主消息循环运行、网络上下文就绪后再初始化。
+   void Start();
+ 
++  // 创建不走任何代理的专用 NetworkContext + URLLoaderFactory：
++  // r0 租约流量永远直连，不受 --proxy-server / 系统代理影响。
++  void EnsureDirectUrlLoaderFactory();
++
+   // 在浏览器进程退出前调用，尽力发送 end 让服务端立即释放实例额度。
+   void Shutdown();
+ 
    // 当前是否已通过 start + token 验签（UI 模块可以用来禁用授权功能）。
    bool IsAuthorized() const { return valid_; }
  
@@ -158,7 +435,7 @@ index 1506a51..65301bd 100644
   private:
    R0LicenseMonitor();
    ~R0LicenseMonitor();
-@@ -83,6 +87,7 @@ class R0LicenseMonitor {
+@@ -83,6 +93,7 @@ class R0LicenseMonitor {
    bool started_ = false;
    bool closing_ = false;
    bool valid_ = false;
@@ -166,6 +443,23 @@ index 1506a51..65301bd 100644
  
    // Configuration.
    std::string api_base_;
+@@ -104,12 +115,16 @@ class R0LicenseMonitor {
+   int heartbeat_seconds_ = 10;
+   unsigned int consecutive_heartbeat_failures_ = 0;
+   unsigned int start_retries_ = 0;
++  // Start-phase tolerance window (null until the first retryable failure).
++  base::TimeTicks start_deadline_tick_;
+ 
+   // Idempotent retry state for alive (§8 of the protocol).
+   std::string pending_alive_body_;
+   std::int64_t pending_alive_sequence_ = 0;
+ 
+   scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory_;
++  // r0 专用的直连 NetworkContext（无代理配置）。
++  mojo::Remote<network::mojom::NetworkContext> direct_network_context_;
+   std::unique_ptr<network::SimpleURLLoader> active_loader_;
+ 
+   base::RepeatingTimer heartbeat_timer_;
 diff --git a/chrome/browser/r0_license/r0_log.h b/chrome/browser/r0_license/r0_log.h
 new file mode 100644
 index 0000000..f7eb420
@@ -229,7 +523,7 @@ index f3f9269..b8ab58d 100644
    // We need to check the ReduceUserAgentMinorVersion feature flag for
    // Android WebView, which does not currently ship a reduced User-Agent.
 diff --git a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc b/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
-index b78748f..e36ab83 100644
+index b78748f..74e2fb1 100644
 --- a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
 +++ b/third_party/blink/renderer/core/fingerprint/fingerprint_manager.cc
 @@ -1681,6 +1681,36 @@ bool FingerprintManager::ParseJsonConfig(const std::string& json_content) {
@@ -269,7 +563,7 @@ index b78748f..e36ab83 100644
    // ============================================================
    // ★ Parse device_memory_fp configuration
    // Overrides navigator.deviceMemory (RAM size in GB)
-@@ -2107,6 +2137,10 @@ HardwareConfig FingerprintManager::GetHardwareConfig() const {
+@@ -2107,7 +2137,15 @@ HardwareConfig FingerprintManager::GetHardwareConfig() const {
    return hardware_config_;
  }
  
@@ -278,8 +572,13 @@ index b78748f..e36ab83 100644
 +}
 +
  DeviceMemoryConfig FingerprintManager::GetDeviceMemoryConfig() const {
++  base::AutoLock auto_lock(lock_);
++  if (!initialized_) {
++    const_cast<FingerprintManager*>(this)->LazyInitialize();
++  }
    return device_memory_config_;
  }
+ 
 diff --git a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.h b/third_party/blink/renderer/core/fingerprint/fingerprint_manager.h
 index a1a1887..d7c8ba7 100644
 --- a/third_party/blink/renderer/core/fingerprint/fingerprint_manager.h

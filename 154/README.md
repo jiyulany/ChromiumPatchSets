@@ -32,9 +32,11 @@ patchsets/154/
 │   │         网络错误/408/429/5xx → 退避重试；其他 4xx → 立即 fatal
 │   │       * 非成功路径打印 start diagnostics 日志
 │   │         (成功不打印 body，防 lease secret 泄漏)
-│   ├── 03-fingerprint-license-gate.patch      ← 8 文件 (2026-09-20)
+│   ├── 03-fingerprint-license-gate.patch      ← 7 文件 (2026-09-20)
 │   │       指纹授权门闩：r0 lease 验签成功前，--fingerprint-config 全部
 │   │       被忽略（hook 退出逻辑只能得到原生指纹的 Chromium，无利用价值）
+│   │       ※ render_process_host_impl.cc 的 hunk 已移至 cross/10
+│   │         （该文件的完整功能块在 10 中携带，见下）
 │   │       * 新增 content::IsFingerprintAuthorized() 门闩
 │   │         (content/public/browser/fingerprint_authorization.h)
 │   │       * r0_license_monitor.cc：验签成功后 SetFingerprintAuthorized()；
@@ -126,6 +128,22 @@ patchsets/154/
 │             rgb(37,99,235) 探针 tampered=false），非纯色真实绘制的
 │             确定性幂等噪声、稳定 hash、往返一致性均不受影响；
 │             fingerprint_manager.cc 的 device-memory lazy-init 已移至 08
+│   └── 10-cdp-detection-evasion.patch         ← 4 文件 (2026-11-22 补收编)
+│           CDP 检测规避（cdp_fp）+ fingerprint-json 传递块补收编：
+│           * render_process_host_impl.cc：完整携带 fingerprint-json
+│             传递块（含授权门闩 IsFingerprintAuthorized）与 cdp_fp 解析，
+│             enabled=true 时向渲染进程追加
+│             --js-flags=--console_output_disabled,--debugger_keyword_disabled
+│           * v8/src/flags/flag-definitions.h：新增两个 V8 flag
+│           * v8/src/inspector/v8-console.cc：console.* 不上报 DevTools/CDP
+│           * v8/src/parsing/parser-base.h：debugger 语句解析为
+│             EmptyStatement（反"无限 debugger"）
+│           ※ 这些改动原先只在本机 base 提交 / v8 嵌套仓库的未提交
+│             脏改动中，split 补丁与 000-all 均未包含；其他平台必须
+│              apply 本补丁才有 cdp_fp 与 fingerprint-json 传递。
+│             注意 v8 是独立 git 仓库，本补丁按 src 根相对路径打包
+│           ※ 配置用法见 patchsets/FRONTEND_INTEGRATION.md 第 21 节；
+│             当前 fingerprint_config.json 中 cdp_fp.enabled=false
 │
 ├── windows/                                   ★ 只 Windows apply
 │   ├── 01-clearcote-base.patch                ← 2 文件 / 4935 bytes
